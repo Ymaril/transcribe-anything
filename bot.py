@@ -3,14 +3,15 @@
 Message -> an instant status reply -> the user's own and shared adapters -> match -> best one -> run.
 The result is a new message (it notifies), the status message is removed.
 """
-import contextlib, json, os, sys, tempfile, threading, time, traceback, urllib.error, urllib.request
+import contextlib, json, os, sys, tempfile, threading, time, traceback, urllib.error, urllib.request, uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import dispatch, sandbox
 from sidecar import sidecar
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CHUNK = 4000  # Telegram allows 4096 characters per message
+API = "https://api.telegram.org"
+LIMIT = 4000  # Telegram allows 4096 characters per message: a longer text goes as a file
 
 
 class TelegramError(Exception):
@@ -30,23 +31,26 @@ def load_env(path=f"{HERE}/.env"):
     return {**env, **os.environ}
 
 
-def api(token, method, params=None, timeout=60):
-    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=json.dumps(params or {}).encode(),
-                                 headers={"Content-Type": "application/json"})
+def _call(token, method, data, content_type, timeout):
+    req = urllib.request.Request(f"{API}/bot{token}/{method}", data=data, headers={"Content-Type": content_type})
     try:
         return json.load(urllib.request.urlopen(req, timeout=timeout))["result"]
     except urllib.error.HTTPError as e:  # not re-raised as is: the message must never carry the URL with the token
         raise TelegramError(e.code, json.loads(e.read() or b"{}").get("description", ""))
 
 
-def chunks(text, size=CHUNK):
-    out = []
-    while len(text) > size:
-        cut = text.rfind("\n", 0, size)
-        cut = cut if cut > 0 else size
-        out.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    return out + [text]
+def api(token, method, params=None, timeout=60):
+    return _call(token, method, json.dumps(params or {}).encode(), "application/json", timeout)
+
+
+def upload(token, method, fields, filename, content, timeout=120):
+    """multipart/form-data: text fields plus one text file in the `document` field."""
+    boundary = uuid.uuid4().hex
+    body = b"".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+                    for k, v in fields.items())
+    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+             "Content-Type: text/plain; charset=utf-8\r\n\r\n").encode() + content + f"\r\n--{boundary}--\r\n".encode()
+    return _call(token, method, body, f"multipart/form-data; boundary={boundary}", timeout)
 
 
 class Telegram:
@@ -54,16 +58,18 @@ class Telegram:
         self.token = token
 
     def send(self, chat_id, text, reply_to):
-        """Replies with text (split if long); returns the id of the first message."""
-        ids = [api(self.token, "sendMessage",
-                   {"chat_id": chat_id, "text": part,
-                    "reply_parameters": {"message_id": reply_to, "allow_sending_without_reply": True}})["message_id"]
-               for part in chunks(text)]
-        return ids[0]
+        """Replies with the text, or with a file if it does not fit into a message; returns the message id."""
+        reply = {"message_id": reply_to, "allow_sending_without_reply": True}
+        if len(text) <= LIMIT:
+            return api(self.token, "sendMessage", {"chat_id": chat_id, "text": text, "reply_parameters": reply})["message_id"]
+        return upload(self.token, "sendDocument",
+                      {"chat_id": chat_id, "reply_parameters": json.dumps(reply),
+                       "caption": "Текст не поместился в сообщение, прикладываю файлом."},
+                      "transcript.txt", text.encode())["message_id"]
 
     def edit(self, chat_id, message_id, text):
         try:
-            api(self.token, "editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text[:CHUNK]})
+            api(self.token, "editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text[:LIMIT]})
         except TelegramError as e:
             if "not modified" not in str(e):
                 raise
@@ -211,37 +217,68 @@ class FakeTelegram:
 
 
 def check():
-    global api
-    text = "".join(f"line {i}\n" for i in range(1500))
-    parts = chunks(text)
-    assert all(len(p) <= CHUNK for p in parts) and len(parts) > 1, [len(p) for p in parts]
-    assert "\n".join(parts).split() == text.split(), "text lost or reordered"
-    assert chunks("short") == ["short"] and chunks("x" * 9000)[0] == "x" * CHUNK
+    global API
+    # the Telegram wrapper against a fake Bot API on localhost: real requests, real multipart encoding
+    import email
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    requests = []
 
-    # the Telegram wrapper, against a fake API
-    calls, real_api = [], api
-    def fake_api(token, method, params=None, timeout=60):
-        calls.append((method, params))
-        if method == "editMessageText" and params["text"] == "same":
-            raise TelegramError(400, "Bad Request: message is not modified")
-        if method == "editMessageText" and params["text"] == "boom":
-            raise TelegramError(429, "Too Many Requests")
-        return {"message_id": 100 + len(calls)}
-    api = fake_api
+    class FakeApi(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            ctype = self.headers["Content-Type"]
+            if ctype.startswith("multipart/"):
+                msg = email.message_from_bytes(f"Content-Type: {ctype}\r\n\r\n".encode() + body)
+                fields = {p.get_param("name", header="content-disposition"): p.get_payload(decode=True)
+                          for p in msg.get_payload()}
+                filename = [p.get_filename() for p in msg.get_payload() if p.get_filename()]
+                requests.append((self.path, fields, filename))
+            else:
+                requests.append((self.path, json.loads(body), None))
+            if requests[-1][1].get("text") == "same":
+                code, answer = 400, {"ok": False, "description": "Bad Request: message is not modified"}
+            else:
+                code, answer = 200, {"ok": True, "result": {"message_id": 100 + len(requests)}}
+            out = json.dumps(answer).encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    srv = HTTPServer(("127.0.0.1", 0), FakeApi)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    real_api_url, API = API, f"http://127.0.0.1:{srv.server_address[1]}"
     try:
         tg = Telegram("tok")
-        assert tg.send(7, "x" * 9000, 55) == 101 and [c[0] for c in calls] == ["sendMessage"] * 3
-        assert all(c[1]["reply_parameters"]["message_id"] == 55 for c in calls)
-        tg.edit(7, 101, "same")                                   # "not modified" is not an error
-        try:
-            tg.edit(7, 101, "boom")
-            raise AssertionError("a real error was swallowed")
-        except TelegramError:
-            pass
+        assert tg.send(7, "short", 55) == 101                             # fits: a plain message
+        path, body, _ = requests[-1]
+        assert path == "/bottok/sendMessage" and body["text"] == "short", requests[-1]
+        assert body["reply_parameters"]["message_id"] == 55
+
+        long_text = "".join(f"строка {i}\n" for i in range(3000))          # does not fit: one file, nothing lost
+        assert len(long_text) > LIMIT and tg.send(7, long_text, 56) == 102
+        path, fields, filename = requests[-1]
+        assert path == "/bottok/sendDocument" and filename == ["transcript.txt"], requests[-1]
+        assert fields["document"].decode() == long_text, "the file differs from the text"
+        assert fields["chat_id"] == b"7" and json.loads(fields["reply_parameters"])["message_id"] == 56
+        assert "файлом" in fields["caption"].decode()
+        assert tg.send(7, "x" * LIMIT, 57) == 103 and requests[-1][0] == "/bottok/sendMessage"   # exactly at the limit
+        assert tg.send(7, "x" * (LIMIT + 1), 57) == 104 and requests[-1][0] == "/bottok/sendDocument"
+
+        tg.edit(7, 101, "same")                                           # "not modified" is not an error
+        n = len(requests)
         tg.edit(7, 101, "y" * 9000)
-        assert len(calls[-1][1]["text"]) == CHUNK
+        assert len(requests[-1][1]["text"]) == LIMIT and len(requests) == n + 1
+        try:
+            Telegram("tok").delete(7, 101)                                # the fake answers ok: just proves the call
+            api("tok", "editMessageText", {"text": "same"})
+            raise AssertionError("an error answer did not raise")
+        except TelegramError as e:
+            assert "not modified" in str(e) and "tok" not in str(e)       # and the token is not in the message
     finally:
-        api = real_api
+        API = real_api_url
 
     # the status ticker
     seen = []
