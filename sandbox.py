@@ -21,11 +21,20 @@ class Completed:
     stderr: str  # the last 4 KB only
 
 
+def image_exists(tag):
+    return subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0
+
+
+def build_image(tag, directory, timeout=None):
+    """Build an image from a directory. Raises RuntimeError with the tail of docker's complaint."""
+    r = subprocess.run(["docker", "build", "-q", "-t", tag, directory], capture_output=True, text=True, timeout=timeout)
+    if r.returncode:
+        raise RuntimeError(f"image build failed: {r.stderr.strip()[-500:]}")
+
+
 def build_base():
     """Adapter images are built FROM this one."""
-    r = subprocess.run(["docker", "build", "-q", "-t", BASE_IMAGE, BASE_DIR], capture_output=True, text=True)
-    if r.returncode:
-        raise RuntimeError(f"base image build failed: {r.stderr}")
+    build_image(BASE_IMAGE, BASE_DIR)
 
 
 def run_sandboxed(image, cmd, stdin="", timeout=300, net="none", env=None, max_output=MAX_OUTPUT):
@@ -87,8 +96,7 @@ def run_networked(image, cmd, stdin="", timeout=300, quota=sidecar.QUOTA, keys=N
     """Like run_sandboxed, but with filtered internet access.
     keys (OPENAI_API_KEY, TELEGRAM_BOT_TOKEN): served by the key proxy, the container only gets its address."""
     sc = sidecar.up(quota, keys)
-    env = {"OPENAI_BASE_URL": f"{sidecar.PROXY_URL}/openai/v1", "OPENAI_API_KEY": "unused",
-           "TB_PROXY": sidecar.PROXY_URL} if keys else None
+    env = sidecar.env() if keys else None
     try:
         return run_sandboxed(image, cmd, stdin, timeout, net=f"container:{sc}", env=env, max_output=max_output)
     finally:
@@ -213,7 +221,7 @@ print(json.dumps({
 """
     sc = sidecar.up(quota=5000, keys=keys)  # quota is far below the big upload: only the exemption lets it through
     try:
-        env = {"TB_PROXY": sidecar.PROXY_URL, "OPENAI_BASE_URL": f"{sidecar.PROXY_URL}/openai/v1"}
+        env = sidecar.env()
         r = run_sandboxed(IMG, ["python", "-"], probe, net=f"container:{sc}", env=env)
         assert r.returncode == 0, r.stderr
         got = json.loads(r.stdout)

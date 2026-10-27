@@ -13,6 +13,11 @@ def docker(*args, env=None):
     return subprocess.run(["docker", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
 
 
+def env():
+    """What a container in the sidecar's network namespace is told about the key proxy (the address, never a key)."""
+    return {"OPENAI_BASE_URL": f"{PROXY_URL}/openai/v1", "OPENAI_API_KEY": "unused", "TB_PROXY": PROXY_URL}
+
+
 _image_lock, _image_ready = threading.Lock(), False
 
 

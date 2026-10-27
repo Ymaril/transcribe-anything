@@ -81,16 +81,15 @@ def image_tag(adapter):
 
 def build(adapter):
     tag = image_tag(adapter)
+    if sandbox.image_exists(tag):  # the usual case never waits for somebody else's long build
+        return tag
     with _build_lock:
-        if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0:
+        if sandbox.image_exists(tag):  # built by someone else while we waited
             return tag
         with open(f"{adapter.path}/Dockerfile") as f:
             if re.search(r"(?im)^\s*#\s*syntax\s*=", f.read()):  # would pull an arbitrary build frontend
                 raise ValueError("Dockerfile with a syntax directive is rejected")
-        r = subprocess.run(["docker", "build", "-q", "-t", tag, adapter.path],
-                           capture_output=True, text=True, timeout=BUILD_TIMEOUT)
-        if r.returncode:
-            raise RuntimeError(f"build failed: {r.stderr.strip()[-500:]}")
+        sandbox.build_image(tag, adapter.path, BUILD_TIMEOUT)
         return tag
 
 
@@ -245,6 +244,24 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
         assert image_tag(a) == tags[mine.index(a)]
         open(f"{a.path}/match", "a").write("# edited\n")
         assert image_tag(a) != tags[mine.index(a)]
+
+        # a long build of one adapter must not hold up an adapter that is already built
+        import time
+        slow = os.path.join(root2, "users/43/slow_build")
+        os.makedirs(slow)
+        with open(f"{slow}/Dockerfile", "w") as f:  # a unique command: Docker must not serve this layer from its cache
+            f.write(f"FROM python:3.12-slim\nRUN sleep 8; echo {os.urandom(8).hex()}\nCOPY . /adapter\n")
+        script(f"{slow}/match", "print(0.0)")
+        slow_adapter = Adapter(slow, "users/43/slow_build", True)
+        tags.append(image_tag(slow_adapter))
+        building = threading.Thread(target=build, args=(slow_adapter,))
+        building.start()
+        time.sleep(1.5)                              # the slow build is in progress and holds the build lock
+        t0 = time.time()
+        build(A["users/43/ok"])                      # already built by the run checks above
+        assert time.time() - t0 < 3, "a built adapter waited for somebody else's build"
+        building.join()
+        assert sandbox.image_exists(image_tag(slow_adapter))
     finally:
         for t in tags:
             subprocess.run(["docker", "rmi", "-f", t], capture_output=True)

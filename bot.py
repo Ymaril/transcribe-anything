@@ -3,21 +3,14 @@
 Message -> an instant status reply -> the user's own and shared adapters -> match -> best one -> run.
 The result is a new message (it notifies), the status message is removed.
 """
-import contextlib, json, os, sys, tempfile, threading, time, traceback, urllib.error, urllib.request, uuid
+import contextlib, os, sys, tempfile, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import dispatch, sandbox
 from sidecar import sidecar
+from telegram_api import Telegram, TelegramError, api
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-API = "https://api.telegram.org"
-LIMIT = 4000  # Telegram allows 4096 characters per message: a longer text goes as a file
-
-
-class TelegramError(Exception):
-    def __init__(self, code, description):
-        super().__init__(f"{code}: {description}")
-        self.code = code
 
 
 def load_env(path=f"{HERE}/.env"):
@@ -29,53 +22,6 @@ def load_env(path=f"{HERE}/.env"):
                 k, _, v = line.partition("=")
                 env[k.strip()] = v.strip().strip("'\"")
     return {**env, **os.environ}
-
-
-def _call(token, method, data, content_type, timeout):
-    req = urllib.request.Request(f"{API}/bot{token}/{method}", data=data, headers={"Content-Type": content_type})
-    try:
-        return json.load(urllib.request.urlopen(req, timeout=timeout))["result"]
-    except urllib.error.HTTPError as e:  # not re-raised as is: the message must never carry the URL with the token
-        raise TelegramError(e.code, json.loads(e.read() or b"{}").get("description", ""))
-
-
-def api(token, method, params=None, timeout=60):
-    return _call(token, method, json.dumps(params or {}).encode(), "application/json", timeout)
-
-
-def upload(token, method, fields, filename, content, timeout=120):
-    """multipart/form-data: text fields plus one text file in the `document` field."""
-    boundary = uuid.uuid4().hex
-    body = b"".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
-                    for k, v in fields.items())
-    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
-             "Content-Type: text/plain; charset=utf-8\r\n\r\n").encode() + content + f"\r\n--{boundary}--\r\n".encode()
-    return _call(token, method, body, f"multipart/form-data; boundary={boundary}", timeout)
-
-
-class Telegram:
-    def __init__(self, token):
-        self.token = token
-
-    def send(self, chat_id, text, reply_to):
-        """Replies with the text, or with a file if it does not fit into a message; returns the message id."""
-        reply = {"message_id": reply_to, "allow_sending_without_reply": True}
-        if len(text) <= LIMIT:
-            return api(self.token, "sendMessage", {"chat_id": chat_id, "text": text, "reply_parameters": reply})["message_id"]
-        return upload(self.token, "sendDocument",
-                      {"chat_id": chat_id, "reply_parameters": json.dumps(reply),
-                       "caption": "Текст не поместился в сообщение, прикладываю файлом."},
-                      "transcript.txt", text.encode())["message_id"]
-
-    def edit(self, chat_id, message_id, text):
-        try:
-            api(self.token, "editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text[:LIMIT]})
-        except TelegramError as e:
-            if "not modified" not in str(e):
-                raise
-
-    def delete(self, chat_id, message_id):
-        api(self.token, "deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
 
 @contextlib.contextmanager
@@ -115,28 +61,42 @@ def start(message, tg, allowed=None):
     return tg.send(message["chat"]["id"], "Ищу подходящий адаптер…", message["message_id"]) if allow else None
 
 
-def handle(message, progress, tg, keys=None, root=dispatch.ROOT):
-    """The rest of one message. progress is the id of the status message that start() sent.
-    tg has send(chat, text, reply_to) -> id, edit(chat, id, text), delete(chat, id)."""
+NO_AGENT = "Создавать новые адаптеры я пока не умею."
+ASK_FOREIGN = ("Не нашёл подходящий адаптер среди ваших и проверенных. {checked}. Могу поискать среди адаптеров других "
+               "пользователей. Они не проверены, и даже сама проверка может передать им ваше сообщение и вложения. Проверить?")
+BUTTONS = [("Да, проверить", "f"), ("Нет", "n")]
+_claimed, _claim_lock = set(), threading.Lock()  # questions already answered: a button can be pressed twice
+
+
+def handle(message, progress, tg, keys=None, root=dispatch.ROOT, foreign=False):
+    """The rest of one message. progress is the id of the status message that start() sent
+    (or of the question the user has just answered). foreign=True: the user agreed to try other users' adapters.
+    tg has send(chat, text, reply_to) -> id, ask(chat, text, reply_to, buttons) -> id, edit(chat, id, text),
+    delete(chat, id)."""
     user, chat, mid = message["from"], message["chat"]["id"], message["message_id"]
 
-    def finish(text):
-        tg.send(chat, text, mid)
+    def finish(text, buttons=None):
+        tg.ask(chat, text, mid, buttons) if buttons else tg.send(chat, text, mid)
         try:
             tg.delete(chat, progress)
         except Exception:
             pass
 
+    adapters = dispatch.foreign(user["id"], root) if foreign else dispatch.visible(user["id"], root)
     with status(lambda s: tg.edit(chat, progress, s), "Ищу подходящий адаптер"):
-        results = dispatch.match_all(dispatch.visible(user["id"], root), message, keys)
+        results = dispatch.match_all(adapters, message, keys)
     for r in results:
         if r.error:
             print(f"match {r.adapter.name}: {r.error}", file=sys.stderr, flush=True)
     best = dispatch.pick(results)
     if not best:
         failed = sum(1 for r in results if r.error)
-        return finish(f"Не нашёл подходящий адаптер. Проверено адаптеров: {len(results)}"
-                      + (f", из них с ошибкой: {failed}" if failed else "") + ".")
+        checked = f"Проверено адаптеров: {len(results)}" + (f", из них с ошибкой: {failed}" if failed else "")
+        if foreign:
+            return finish(f"Среди адаптеров других пользователей тоже ничего не подошло. {checked}. {NO_AGENT}")
+        if dispatch.foreign(user["id"], root):  # there is somebody else's adapter to try, but only with consent
+            return finish(ASK_FOREIGN.format(checked=checked), BUTTONS)
+        return finish(f"Не нашёл подходящий адаптер. {checked}. {NO_AGENT}")
     try:
         with status(lambda s: tg.edit(chat, progress, s), f"Обрабатываю ({best.adapter.name})"):
             text = dispatch.run(best.adapter, message, keys)
@@ -144,6 +104,32 @@ def handle(message, progress, tg, keys=None, root=dispatch.ROOT):
         print(f"run {best.adapter.name}: {e.reason}: {e.detail}", file=sys.stderr, flush=True)
         return finish(f"Адаптер {best.adapter.name} не смог обработать сообщение: {e.reason}.")
     finish(text)
+
+
+def on_callback(cb, tg, keys=None, root=dispatch.ROOT, allowed=None):
+    """A button under our question. The question is a reply to the user's message, so Telegram hands the original
+    message back inside the callback: no state is kept for this."""
+    try:
+        tg.answer(cb["id"])
+    except TelegramError:  # "query is too old" after a downtime: the button still deserves its answer
+        pass
+    msg, user = cb.get("message") or {}, cb["from"]
+    if msg.get("chat", {}).get("type") != "private" or (allowed and user["id"] not in allowed):
+        return
+    chat, question = msg["chat"]["id"], msg["message_id"]
+    original = msg.get("reply_to_message")
+    if not original:  # deleted, or too old for Telegram to hand it back
+        return tg.edit(chat, question, "Не вижу исходного сообщения. Пришлите его ещё раз.")
+    if original.get("from", {}).get("id") != user["id"]:
+        return
+    with _claim_lock:
+        if (chat, question) in _claimed:
+            return
+        _claimed.add((chat, question))
+    if cb.get("data") == "f":
+        handle(original, question, tg, keys, root, foreign=True)
+    else:
+        tg.edit(chat, question, f"Хорошо. {NO_AGENT}")
 
 
 def main():
@@ -164,6 +150,12 @@ def main():
             except Exception:
                 pass
 
+    def safe_callback(cb):
+        try:
+            on_callback(cb, tg, keys, allowed=allowed)
+        except Exception:
+            traceback.print_exc()
+
     sandbox.build_base()
     print(f"started as @{api(token, 'getMe')['username']}; "
           + (f"allowed users: {sorted(allowed)}" if allowed else "OPEN to everyone"), flush=True)
@@ -171,7 +163,8 @@ def main():
     with ThreadPoolExecutor(64) as pool:  # threads are cheap: the container slots in dispatch limit the load
         while True:
             try:
-                updates = api(token, "getUpdates", {"timeout": 30, "offset": offset, "allowed_updates": ["message"]}, timeout=45)
+                updates = api(token, "getUpdates", {"timeout": 30, "offset": offset,
+                                                    "allowed_updates": ["message", "callback_query"]}, timeout=45)
             except TelegramError as e:
                 if e.code in (401, 409):  # bad token, or a webhook / another poller owns this bot
                     raise
@@ -184,15 +177,20 @@ def main():
                 continue
             for u in updates:
                 offset = u["update_id"] + 1
-                if "message" not in u:
-                    continue
-                try:
-                    progress = start(u["message"], tg, allowed)  # answered here, not when a worker gets free
-                except Exception:
-                    traceback.print_exc()
-                    continue
-                if progress:
-                    pool.submit(safe, u["message"], progress)
+                route(u, tg, allowed, lambda m, p: pool.submit(safe, m, p), lambda cb: pool.submit(safe_callback, cb))
+
+
+def route(u, tg, allowed, on_message, on_button):
+    """One update from getUpdates. on_message(message, progress) and on_button(callback) hand the work to a worker."""
+    if "callback_query" in u:
+        return on_button(u["callback_query"])
+    if "message" in u:
+        try:
+            progress = start(u["message"], tg, allowed)  # answered here, not when a worker gets free
+        except Exception:
+            return traceback.print_exc()
+        if progress:
+            on_message(u["message"], progress)
 
 
 class FakeTelegram:
@@ -203,6 +201,14 @@ class FakeTelegram:
         self.n += 1
         self.ops.append(("send", chat, text, reply_to, self.n))
         return self.n
+
+    def ask(self, chat, text, reply_to, buttons):
+        self.n += 1
+        self.ops.append(("send", chat, text, reply_to, self.n, buttons))
+        return self.n
+
+    def answer(self, callback_id):
+        self.ops.append(("answer", callback_id))
 
     def edit(self, chat, mid, text):
         if self.fail_edit:
@@ -217,68 +223,33 @@ class FakeTelegram:
 
 
 def check():
-    global API
-    # the Telegram wrapper against a fake Bot API on localhost: real requests, real multipart encoding
-    import email
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-    requests = []
+    # routing of updates: no adapters, no docker, only who gets what
+    got = []
+    private = {"message_id": 5, "chat": {"id": 142, "type": "private"}, "from": {"id": 42}, "text": "hi"}
+    route_it = lambda u, tg, allowed=None: route(u, tg, allowed, lambda m, p: got.append(("message", m, p)),
+                                                 lambda cb: got.append(("button", cb)))
+    tg = FakeTelegram()
+    route_it({"update_id": 1, "message": private}, tg)
+    assert got == [("message", private, 1)] and len(tg.ops) == 1, (got, tg.ops)   # answered first, then handed over
+    got.clear()
+    button = {"id": "c1", "from": {"id": 42}, "data": "f"}
+    tg = FakeTelegram()
+    route_it({"update_id": 2, "callback_query": button}, tg)
+    assert got == [("button", button)] and tg.ops == [], (got, tg.ops)              # no instant answer for buttons
+    got.clear()
+    tg = FakeTelegram()
+    for ignored in ({"update_id": 3, "edited_message": private}, {"update_id": 4},
+                    {"update_id": 5, "message": {**private, "chat": {"id": 1, "type": "group"}}},
+                    {"update_id": 6, "message": {**private, "from": {"id": 9, "is_bot": True}}}):
+        route_it(ignored, tg)
+    route_it({"update_id": 7, "message": private}, tg, allowed={7})                 # not on the list
+    assert got == [] and tg.ops == [], (got, tg.ops)
 
-    class FakeApi(BaseHTTPRequestHandler):
-        def log_message(self, *a): pass
-
-        def do_POST(self):
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            ctype = self.headers["Content-Type"]
-            if ctype.startswith("multipart/"):
-                msg = email.message_from_bytes(f"Content-Type: {ctype}\r\n\r\n".encode() + body)
-                fields = {p.get_param("name", header="content-disposition"): p.get_payload(decode=True)
-                          for p in msg.get_payload()}
-                filename = [p.get_filename() for p in msg.get_payload() if p.get_filename()]
-                requests.append((self.path, fields, filename))
-            else:
-                requests.append((self.path, json.loads(body), None))
-            if requests[-1][1].get("text") == "same":
-                code, answer = 400, {"ok": False, "description": "Bad Request: message is not modified"}
-            else:
-                code, answer = 200, {"ok": True, "result": {"message_id": 100 + len(requests)}}
-            out = json.dumps(answer).encode()
-            self.send_response(code)
-            self.send_header("Content-Length", str(len(out)))
-            self.end_headers()
-            self.wfile.write(out)
-
-    srv = HTTPServer(("127.0.0.1", 0), FakeApi)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    real_api_url, API = API, f"http://127.0.0.1:{srv.server_address[1]}"
-    try:
-        tg = Telegram("tok")
-        assert tg.send(7, "short", 55) == 101                             # fits: a plain message
-        path, body, _ = requests[-1]
-        assert path == "/bottok/sendMessage" and body["text"] == "short", requests[-1]
-        assert body["reply_parameters"]["message_id"] == 55
-
-        long_text = "".join(f"строка {i}\n" for i in range(3000))          # does not fit: one file, nothing lost
-        assert len(long_text) > LIMIT and tg.send(7, long_text, 56) == 102
-        path, fields, filename = requests[-1]
-        assert path == "/bottok/sendDocument" and filename == ["transcript.txt"], requests[-1]
-        assert fields["document"].decode() == long_text, "the file differs from the text"
-        assert fields["chat_id"] == b"7" and json.loads(fields["reply_parameters"])["message_id"] == 56
-        assert "файлом" in fields["caption"].decode()
-        assert tg.send(7, "x" * LIMIT, 57) == 103 and requests[-1][0] == "/bottok/sendMessage"   # exactly at the limit
-        assert tg.send(7, "x" * (LIMIT + 1), 57) == 104 and requests[-1][0] == "/bottok/sendDocument"
-
-        tg.edit(7, 101, "same")                                           # "not modified" is not an error
-        n = len(requests)
-        tg.edit(7, 101, "y" * 9000)
-        assert len(requests[-1][1]["text"]) == LIMIT and len(requests) == n + 1
-        try:
-            Telegram("tok").delete(7, 101)                                # the fake answers ok: just proves the call
-            api("tok", "editMessageText", {"text": "same"})
-            raise AssertionError("an error answer did not raise")
-        except TelegramError as e:
-            assert "not modified" in str(e) and "tok" not in str(e)       # and the token is not in the message
-    finally:
-        API = real_api_url
+    class Broken(FakeTelegram):                                                     # Telegram refuses our status
+        def send(self, *a):
+            raise TelegramError(500, "boom")
+    route_it({"update_id": 8, "message": private}, Broken())                        # must not take the polling loop down
+    assert got == []
 
     # the status ticker
     seen = []
@@ -321,7 +292,7 @@ def check():
         tg = FakeTelegram()
         process(message("hello"), tg)
         assert tg.ops[0] == ("send", 142, "Ищу подходящий адаптер…", 5, 1), tg.ops
-        assert tg.replies() == ["Не нашёл подходящий адаптер. Проверено адаптеров: 0."], tg.ops
+        assert tg.replies() == ["Не нашёл подходящий адаптер. Проверено адаптеров: 0. " + NO_AGENT], tg.ops
         assert tg.ops[-1] == ("delete", 142, 1), tg.ops              # the status message is removed at the end
 
         adapter("shared/hello", "print(0.9 if m.get('text') == 'hello' else 0.0)", "print('world')")
@@ -357,9 +328,62 @@ def check():
         process({"message_id": 1, "chat": {"id": 1, "type": "channel"}, "text": "channel post"}, tg)
         process({**message("hello"), "chat": {"id": -5, "type": "group"}}, tg)   # groups: private chats only
         assert tg.ops == [], tg.ops
+
+        # other users' adapters are tried only with the user's consent
+        adapter("users/7/stranger", "print(0.9 if m.get('text') == 'stranger-only' else 0.0)", "print('from stranger')")
+        sent = lambda tg: [o[2] for o in tg.ops if o[0] == "send"]
+        tg = FakeTelegram()
+        process(message("stranger-only"), tg)
+        (ask,) = [o for o in tg.ops if o[0] == "send" and len(o) == 6]
+        assert "Могу поискать среди адаптеров других пользователей" in ask[2] and "не проверены" in ask[2], ask
+        assert ask[3] == 5 and [d for _, d in ask[5]] == ["f", "n"], ask      # a reply to the user's message
+        assert tg.ops[-1] == ("delete", 142, 1), tg.ops                       # the status is gone, the question stays
+        assert not [o for o in tg.ops if o[0] == "edit" and "stranger" in o[3]], "the stranger ran without consent"
+
+        def pressed(data, user=42, original=None, question=9, cb_id="c1", chat_type="private"):
+            return {"id": cb_id, "from": {"id": user}, "data": data,
+                    "message": {"message_id": question, "chat": {"id": 142, "type": chat_type},
+                                **({"reply_to_message": original} if original else {})}}
+
+        original = message("stranger-only")
+        tg = FakeTelegram()
+        on_callback(pressed("f", original=original), tg, root=root)
+        assert sent(tg) == ["from stranger"], tg.ops
+        assert tg.ops[0] == ("answer", "c1") and tg.ops[-1] == ("delete", 142, 9), tg.ops   # the question became the status
+        assert ("edit", 142, 9, "Обрабатываю (users/7/stranger)…") in tg.ops, tg.ops
+        n = len(tg.ops)
+        on_callback(pressed("f", original=original), tg, root=root)           # the same button pressed twice
+        assert [o for o in tg.ops[n:] if o[0] != "answer"] == [], tg.ops[n:]
+
+        class Late(FakeTelegram):                                             # the click was made while we were down
+            def answer(self, callback_id):
+                raise TelegramError(400, "Bad Request: query is too old and response timeout expired")
+
+        tg = Late()
+        on_callback(pressed("f", original=message("stranger-only"), question=16), tg, root=root)
+        assert sent(tg) == ["from stranger"], tg.ops                          # and the button still works
+
+        tg = FakeTelegram()
+        on_callback(pressed("n", original=original, question=10), tg, root=root)
+        assert tg.ops == [("answer", "c1"), ("edit", 142, 10, "Хорошо. " + NO_AGENT)], tg.ops   # nothing runs
+
+        tg = FakeTelegram()
+        on_callback(pressed("f", question=11), tg, root=root)                 # the original message is gone
+        assert len(tg.ops) == 2 and "Не вижу исходного сообщения" in tg.ops[1][3], tg.ops
+
+        tg = FakeTelegram()
+        on_callback(pressed("f", original=message("stranger-only"), question=12, user=99), tg, root=root)
+        on_callback(pressed("f", original=original, question=13), tg, root=root, allowed={7})
+        on_callback(pressed("f", original=original, question=14, chat_type="group"), tg, root=root)
+        assert tg.ops == [("answer", "c1")] * 3, tg.ops                       # not his question / not allowed / group
+
+        tg = FakeTelegram()
+        on_callback(pressed("f", original=message("nobody"), question=15), tg, root=root)
+        assert sent(tg) == ["Среди адаптеров других пользователей тоже ничего не подошло. Проверено адаптеров: 1. "
+                            + NO_AGENT], tg.ops
     finally:
         import shutil
-        for a in dispatch.visible(42, root):
+        for a in dispatch.visible(42, root) + dispatch.foreign(42, root):
             os.system(f"docker rmi -f {dispatch.image_tag(a)} >/dev/null 2>&1")
         shutil.rmtree(root, ignore_errors=True)
     print("ok")
