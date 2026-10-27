@@ -1,10 +1,24 @@
-import os, subprocess, uuid
+"""Run untrusted code in throwaway containers, as utilities: stdin in, stdout/stderr out. No files are shared."""
+import collections, os, subprocess, threading, uuid
+from dataclasses import dataclass
 
 from sidecar import sidecar
 
-
 BASE_IMAGE = "transcribe-base"
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapters", "base")
+MAX_INPUT = 1024 * 1024
+MAX_OUTPUT = 2 * 1024 * 1024
+
+
+class OutputTooLarge(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Completed:
+    returncode: int
+    stdout: str
+    stderr: str  # the last 4 KB only
 
 
 def build_base():
@@ -14,51 +28,109 @@ def build_base():
         raise RuntimeError(f"base image build failed: {r.stderr}")
 
 
-def run_sandboxed(image, cmd, workdir, timeout=300, net="none", env=None):
-    """Run cmd from image in a throwaway container. workdir is mounted rw at /work.
-    net: "none" or "container:<sidecar>" (see sidecar.up)."""
+def run_sandboxed(image, cmd, stdin="", timeout=300, net="none", env=None, max_output=MAX_OUTPUT):
+    """Run cmd from image in a throwaway container. Scratch space is /tmp (tmpfs).
+    net: "none" or "container:<sidecar>" (see sidecar.up). Raises subprocess.TimeoutExpired, OutputTooLarge."""
+    data = stdin.encode()
+    if len(data) > MAX_INPUT:
+        raise ValueError("input is too large")
     name = f"tb-{uuid.uuid4().hex[:12]}"
-    args = ["docker", "run", "--rm", "--name", name, "--network", net,
+    args = ["docker", "run", "--rm", "-i", "--name", name, "--network", net,
             "--read-only", "--tmpfs", "/tmp:size=512m", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--pids-limit", "256",
             "--memory", "1g", "--cpus", "1", "--user", "65534:65534",
             "-e", "HOME=/tmp", *[a for k, v in (env or {}).items() for a in ("-e", f"{k}={v}")],
-            "-v", f"{workdir}:/work", "-w", "/work", image, *cmd]
-    try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
+            "-w", "/tmp", image, *cmd]
+    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, tail, too_big = bytearray(), collections.deque(maxlen=4096), []
+
+    def kill():
         subprocess.run(["docker", "kill", name], capture_output=True)
+
+    def read_out():
+        while chunk := p.stdout.read(65536):  # keeps draining after the limit: a full pipe would block the container
+            if too_big:
+                continue
+            if len(out) + len(chunk) > max_output:
+                too_big.append(True)
+                threading.Thread(target=kill, daemon=True).start()
+            else:
+                out.extend(chunk)
+
+    def read_err():
+        while chunk := p.stderr.read(4096):
+            tail.extend(chunk)
+
+    readers = [threading.Thread(target=f, daemon=True) for f in (read_out, read_err)]
+    for t in readers:
+        t.start()
+    try:
+        try:
+            p.stdin.write(data)
+            p.stdin.close()
+        except BrokenPipeError:  # the program did not want its input
+            pass
+        p.wait(timeout)
+    except subprocess.TimeoutExpired:
+        kill()
+        p.wait()
         raise
+    finally:
+        for t in readers:
+            t.join(10)
+    if too_big:
+        raise OutputTooLarge()
+    return Completed(p.returncode, out.decode("utf-8", "replace"), bytes(tail).decode("utf-8", "replace"))
 
 
-def run_networked(image, cmd, workdir, timeout=300, quota=sidecar.QUOTA, keys=None):
+def run_networked(image, cmd, stdin="", timeout=300, quota=sidecar.QUOTA, keys=None, max_output=MAX_OUTPUT):
     """Like run_sandboxed, but with filtered internet access.
     keys (OPENAI_API_KEY, TELEGRAM_BOT_TOKEN): served by the key proxy, the container only gets its address."""
     sc = sidecar.up(quota, keys)
     env = {"OPENAI_BASE_URL": f"{sidecar.PROXY_URL}/openai/v1", "OPENAI_API_KEY": "unused",
            "TB_PROXY": sidecar.PROXY_URL} if keys else None
     try:
-        return run_sandboxed(image, cmd, workdir, timeout, net=f"container:{sc}", env=env)
+        return run_sandboxed(image, cmd, stdin, timeout, net=f"container:{sc}", env=env, max_output=max_output)
     finally:
         sidecar.down(sc)
 
 
 if __name__ == "__main__":  # self-check: python3 sandbox.py (needs internet)
-    import json, os, tempfile
+    import json, tempfile
     docker = sidecar.docker
     IMG = "python:3.12-slim"
-    d = tempfile.mkdtemp()
-    os.chmod(d, 0o777)  # container runs as nobody
 
-    r = run_sandboxed(IMG, ["python", "-c", "import urllib.request as u; u.urlopen('http://1.1.1.1', timeout=3)"], d)
-    assert r.returncode != 0, "network is not blocked"
+    def py(code, **kw):
+        return run_sandboxed(IMG, ["python", "-c", code], **kw)
 
-    r = run_sandboxed(IMG, ["sh", "-c", "touch ok"], d)
-    assert r.returncode == 0 and os.path.exists(f"{d}/ok"), f"/work not writable: {r.stderr}"
+    assert py("import urllib.request as u; u.urlopen('http://1.1.1.1', timeout=3)").returncode != 0, \
+        "network is not blocked"
+    assert run_sandboxed(IMG, ["sh", "-c", "touch /tmp/ok"]).returncode == 0, "/tmp is not writable"
+    assert run_sandboxed(IMG, ["sh", "-c", "touch /etc/x"]).returncode != 0, "root fs is writable"
+    assert run_sandboxed(IMG, ["sh", "-c", "touch /work/x"]).returncode != 0, "there must be no /work"
 
-    r = run_sandboxed(IMG, ["sh", "-c", "touch /etc/x"], d)
-    assert r.returncode != 0, "root fs is writable"
+    # stdin in, stdout/stderr out
+    r = run_sandboxed(IMG, ["sh", "-c", "cat; echo err >&2; exit 3"], stdin="привет\n")
+    assert (r.returncode, r.stdout, r.stderr) == (3, "привет\n", "err\n"), r
+    assert py("import sys; sys.stderr.write('a' * 10000 + 'END')").stderr.endswith("END"), "stderr tail lost"
+    assert len(py("import sys; sys.stderr.write('a' * 10000)").stderr) == 4096
+
+    # limits: input, output and time
+    try:
+        run_sandboxed(IMG, ["cat"], stdin="x" * (MAX_INPUT + 1))
+        raise AssertionError("huge input accepted")
+    except ValueError:
+        pass
+    try:
+        py("print('x' * 10_000_000)", max_output=1_000_000)
+        raise AssertionError("huge output accepted")
+    except OutputTooLarge:
+        pass
+    try:
+        run_sandboxed(IMG, ["sleep", "30"], timeout=2)
+        raise AssertionError("timeout did not fire")
+    except subprocess.TimeoutExpired:
+        pass
 
     # adapter image = its own image built from a base
     ad = tempfile.mkdtemp()
@@ -66,16 +138,10 @@ if __name__ == "__main__":  # self-check: python3 sandbox.py (needs internet)
         f.write(f"FROM {IMG}\nRUN echo derived > /marker\n")
     subprocess.run(["docker", "build", "-q", "-t", "tb-selfcheck", ad], check=True, capture_output=True)
     try:
-        r = run_sandboxed("tb-selfcheck", ["cat", "/marker"], d)
+        r = run_sandboxed("tb-selfcheck", ["cat", "/marker"])
         assert r.stdout.strip() == "derived", f"derived image not used: {r.stderr}"
     finally:
         subprocess.run(["docker", "rmi", "tb-selfcheck"], capture_output=True)
-
-    try:
-        run_sandboxed(IMG, ["sleep", "30"], d, timeout=2)
-        raise AssertionError("timeout did not fire")
-    except subprocess.TimeoutExpired:
-        pass
 
     # filtered network: internet and DNS yes; other containers (private ranges) and raw sockets no
     probe = """
@@ -91,8 +157,6 @@ def raw():
     except PermissionError: return False
 print(json.dumps({"internet": tcp("1.1.1.1", 80), "dns": dns(), "neighbour": tcp(sys.argv[1], 8000), "raw": raw()}))
 """
-    with open(f"{d}/probe.py", "w") as f:
-        f.write(probe)
     neighbour = "tb-selfcheck-neighbour"
     docker("rm", "-f", neighbour)
     assert docker("run", "-d", "--rm", "--name", neighbour, IMG, "python", "-m", "http.server", "8000").returncode == 0
@@ -102,7 +166,7 @@ print(json.dumps({"internet": tcp("1.1.1.1", 80), "dns": dns(), "neighbour": tcp
         control = subprocess.run(["docker", "run", "--rm", IMG, "python", "-c",
                                   f"import socket; socket.create_connection(('{ip}', 8000), timeout=3)"])
         assert control.returncode == 0, "control failed: neighbour must be reachable without the filter"
-        r = run_networked(IMG, ["python", "probe.py", ip], d)
+        r = run_networked(IMG, ["python", "-", ip], probe)
         assert r.returncode == 0, r.stderr
         got = json.loads(r.stdout)
         assert got == {"internet": True, "dns": True, "neighbour": False, "raw": False}, got
@@ -116,7 +180,7 @@ print(json.dumps({"internet": tcp("1.1.1.1", 80), "dns": dns(), "neighbour": tcp
                 "for _ in range(2000):\n"
                 "    try: s.sendto(b'x' * 1000, ('1.1.1.1', 9))\n"
                 "    except OSError: pass\n")
-        run_sandboxed(IMG, ["python", "-c", send], d, net=f"container:{sc}")
+        run_sandboxed(IMG, ["python", "-c", send], net=f"container:{sc}")
         rules = docker("exec", sc, "iptables", "-L", "OUTPUT", "-v", "-x", "-n").stdout.splitlines()
         drop_all = [l.split() for l in rules if l.split()[2:3] == ["DROP"] and l.split()[-1] == "0.0.0.0/0"
                     and l.split()[-2] == "0.0.0.0/0"]
@@ -147,12 +211,10 @@ print(json.dumps({
     "base_url": os.environ["OPENAI_BASE_URL"],
 }))
 """
-    with open(f"{d}/probe.py", "w") as f:
-        f.write(probe)
     sc = sidecar.up(quota=5000, keys=keys)  # quota is far below the big upload: only the exemption lets it through
     try:
         env = {"TB_PROXY": sidecar.PROXY_URL, "OPENAI_BASE_URL": f"{sidecar.PROXY_URL}/openai/v1"}
-        r = run_sandboxed(IMG, ["python", "probe.py"], d, net=f"container:{sc}", env=env)
+        r = run_sandboxed(IMG, ["python", "-"], probe, net=f"container:{sc}", env=env)
         assert r.returncode == 0, r.stderr
         got = json.loads(r.stdout)
         assert got == {"tg_reached": 401, "openai_reached": 401, "big_upload_reached": 401, "bad_model": 403,
@@ -173,7 +235,7 @@ print(json.dumps({
 
     # run_networked passes the proxy address to the container and cleans up
     r = run_networked(IMG, ["python", "-c", "import os; print(os.environ['TB_PROXY'], os.environ['OPENAI_API_KEY'])"],
-                      d, keys=keys)
+                      keys=keys)
     assert r.stdout.split() == [sidecar.PROXY_URL, "unused"], (r.stdout, r.stderr)
 
     # fail closed: broken rules must not leave a usable sidecar behind

@@ -1,10 +1,11 @@
-"""Adapter discovery, image building and match.
+"""Adapter discovery, image building, match and run.
 
 An adapter is a folder with a Dockerfile; the image must contain executable /adapter/match and /adapter/run.
-Both get the Telegram message as /work/message.json. match prints a confidence 0..1 (last non-empty line);
-run writes the result to /work/out/transcript.txt.
+They are utilities: the Telegram message (JSON) comes on stdin.
+match prints a confidence 0..1 (last non-empty line of stdout); run prints the transcript to stdout.
+stderr is for the log; scratch space is /tmp.
 """
-import contextlib, hashlib, json, os, re, shutil, subprocess, tempfile
+import hashlib, json, os, re, shutil, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -13,6 +14,7 @@ import sandbox
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapters")
 THRESHOLD = 0.5  # ponytail: a guess, tune on real adapters
 MATCH_TIMEOUT = 10
+MATCH_OUTPUT = 64 * 1024
 BUILD_TIMEOUT = 600
 RUN_TIMEOUT = 900
 MAX_TRANSCRIPT = 2 * 1024 * 1024  # bytes
@@ -38,29 +40,6 @@ class AdapterError(Exception):
     def __init__(self, reason, detail=""):
         super().__init__(reason)
         self.reason, self.detail = reason, detail
-
-
-def _rm(d):
-    shutil.rmtree(d, ignore_errors=True)
-    if os.path.exists(d):  # the container left directories we may not enter: let a root container delete them
-        subprocess.run(["docker", "run", "--rm", "--network", "none", "-v", f"{d}:/w", "alpine",
-                        "sh", "-c", "rm -rf /w/* /w/.[!.]*"], capture_output=True)
-        shutil.rmtree(d, ignore_errors=True)
-
-
-@contextlib.contextmanager
-def job_dir(message):
-    """/work for one container run: message.json in, out/ for the result. Always removed afterwards."""
-    d = tempfile.mkdtemp(prefix="tb-job-")
-    try:
-        os.chmod(d, 0o777)  # containers run as nobody
-        os.mkdir(f"{d}/out")
-        os.chmod(f"{d}/out", 0o777)
-        with open(f"{d}/message.json", "w") as f:
-            json.dump(message, f)
-        yield d
-    finally:
-        _rm(d)
 
 
 def _dirs(path):
@@ -109,9 +88,8 @@ def build(adapter):
 
 def _match(adapter, message, keys):
     try:
-        tag = build(adapter)
-        with job_dir(message) as d:
-            r = sandbox.run_networked(tag, ["/adapter/match"], d, timeout=MATCH_TIMEOUT, keys=keys)
+        r = sandbox.run_networked(build(adapter), ["/adapter/match"], json.dumps(message),
+                                  timeout=MATCH_TIMEOUT, keys=keys, max_output=MATCH_OUTPUT)
         if r.returncode:
             return Result(adapter, 0.0, f"match exited with {r.returncode}: {r.stderr.strip()[-200:]}")
         lines = [l for l in r.stdout.splitlines() if l.strip()]
@@ -124,6 +102,8 @@ def _match(adapter, message, keys):
         return Result(adapter, score)
     except subprocess.TimeoutExpired:
         return Result(adapter, 0.0, "timeout")
+    except sandbox.OutputTooLarge:
+        return Result(adapter, 0.0, "match printed too much")
     except (ValueError, RuntimeError, OSError) as e:
         return Result(adapter, 0.0, str(e))
 
@@ -134,32 +114,23 @@ def match_all(adapters, message, keys=None):
 
 
 def run(adapter, message, keys=None, timeout=RUN_TIMEOUT, max_bytes=MAX_TRANSCRIPT):
-    """Run the adapter on the message and return the transcript, or raise AdapterError."""
+    """Run the adapter on the message and return the transcript (its stdout), or raise AdapterError."""
     try:
         tag = build(adapter)
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
         raise AdapterError("cannot build the adapter", str(e))
-    with job_dir(message) as d:
-        try:
-            r = sandbox.run_networked(tag, ["/adapter/run"], d, timeout=timeout, keys=keys)
-        except subprocess.TimeoutExpired:
-            raise AdapterError("timeout")
-        if r.returncode:
-            raise AdapterError(f"run exited with {r.returncode}", r.stderr.strip()[-500:])
-        # the container wrote this tree: a symlink must not make us read a file of the host
-        path = os.path.realpath(f"{d}/out/transcript.txt")
-        if not path.startswith(os.path.realpath(d) + os.sep) or not os.path.isfile(path):
-            raise AdapterError("no transcript.txt written (or it points outside of /work)")
-        if os.path.getsize(path) > max_bytes:
-            raise AdapterError("transcript is too large")
-        try:
-            with open(path, encoding="utf-8") as f:
-                text = f.read().strip()
-        except UnicodeDecodeError:
-            raise AdapterError("transcript is not valid UTF-8")
-    if not text:
+    try:
+        r = sandbox.run_networked(tag, ["/adapter/run"], json.dumps(message),
+                                  timeout=timeout, keys=keys, max_output=max_bytes)
+    except subprocess.TimeoutExpired:
+        raise AdapterError("timeout")
+    except sandbox.OutputTooLarge:
+        raise AdapterError("transcript is too large")
+    if r.returncode:
+        raise AdapterError(f"run exited with {r.returncode}", r.stderr.strip()[-500:])
+    if not r.stdout.strip():
         raise AdapterError("transcript is empty")
-    return text
+    return r.stdout.strip()
 
 
 def pick(results):
@@ -173,7 +144,7 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
 
     def script(path, code):
         with open(path, "w", encoding="utf-8") as f:
-            f.write("#!/usr/local/bin/python\nimport json, os, sys, time\nm = json.load(open('/work/message.json'))\n" + code)
+            f.write("#!/usr/local/bin/python\nimport json, sys, time\nm = json.load(sys.stdin)\n" + code)
         os.chmod(path, 0o755)
 
     def adapter(path, match_code, run_code=None, base=root):
@@ -184,18 +155,13 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
         if run_code is not None:
             script(f"{base}/{path}/run", run_code)
 
-    OUT = "/work/out/transcript.txt"
     for name, code in {
-        "ok": f"open('{OUT}', 'w', encoding='utf-8').write('текст: ' + m['text'] + '\\n')",
-        "junk": ("os.makedirs('/work/out/j/a'); open('/work/out/j/a/f', 'w').write('x'); "
-                 f"os.chmod('/work/out/j/a', 0o500); open('{OUT}', 'w').write('ok')"),
+        "ok": "sys.stderr.write('log line\\n'); print('  текст: ' + m['text'] + '\\n')",
         "none": "pass",
-        "blank": f"open('{OUT}', 'w').write('  \\n')",
+        "blank": "print('   ')",
         "crash": "sys.stderr.write('boom'); sys.exit(5)",
         "sleepy": "time.sleep(60)",
-        "huge": f"open('{OUT}', 'w').write('x' * 2000)",
-        "binary": f"open('{OUT}', 'wb').write(b'\\xff\\xfe')",
-        "link": f"os.symlink('/etc/hostname', '{OUT}')",  # would make the host read its own file
+        "huge": "print('x' * 2000)",
     }.items():
         adapter(f"users/43/{name}", "print(0.0)", code, base=root2)
     adapter("users/43/norun", "print(0.0)", base=root2)
@@ -205,6 +171,7 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
     adapter("users/42/slow", "time.sleep(60)")
     adapter("users/42/broken", "print('hello')")
     adapter("users/42/crash", "raise SystemExit(3)")
+    adapter("users/42/chatty", "print('x' * 1_000_000)")
     adapter("users/42/evil", "print(1.0)")
     with open(f"{root}/users/42/evil/Dockerfile", "w") as f:
         f.write("# syntax=evil/frontend\nFROM python:3.12-slim\nCOPY . /adapter\n")
@@ -213,8 +180,9 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
     open(f"{root}/shared/README", "w").write("not an adapter")
 
     names = lambda xs: sorted(a.name for a in xs)
-    assert names(visible(42, root)) == ["shared/voice", "users/42/broken", "users/42/crash", "users/42/evil",
-                                        "users/42/same_as_shared", "users/42/slow", "users/42/tiktok"]
+    assert names(visible(42, root)) == ["shared/voice", "users/42/broken", "users/42/chatty", "users/42/crash",
+                                        "users/42/evil", "users/42/same_as_shared", "users/42/slow",
+                                        "users/42/tiktok"]
     assert names(foreign(42, root)) == ["users/7/stranger_voice"]
     assert names(visible(99, root)) == ["shared/voice"]
 
@@ -226,10 +194,12 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
         assert res["users/42/slow"].error == "timeout", res["users/42/slow"]
         assert "no score" in res["users/42/broken"].error, res["users/42/broken"]
         assert "exited with 3" in res["users/42/crash"].error, res["users/42/crash"]
+        assert "printed too much" in res["users/42/chatty"].error, res["users/42/chatty"]
         assert "syntax directive" in res["users/42/evil"].error, res["users/42/evil"]
-        assert all(res[n].score == 0.0 for n in ("users/42/slow", "users/42/broken", "users/42/crash", "users/42/evil"))
+        for n in ("slow", "broken", "crash", "chatty", "evil"):
+            assert res[f"users/42/{n}"].score == 0.0, n
 
-        # equal scores: the user's own adapter wins; a lower own score does not beat a higher shared one
+        # equal scores: the user's own adapter wins
         assert pick(list(res.values())).adapter.name == "users/42/same_as_shared"
         # a tiktok link: only that adapter is confident
         link = {r.adapter.name: r for r in match_all(mine, {"text": "https://tiktok.com/@a/video/1"})}
@@ -239,34 +209,24 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
         # unverified adapters are matched only on request
         assert pick(match_all(foreign(42, root), {"voice": {}})).adapter.name == "users/7/stranger_voice"
 
-        # run: the transcript contract, errors, and cleanup of the job directories
+        # run: stdout is the transcript, stderr is only for the log
         A = {a.name: a for a in visible(43, root2)}
-        jobs = tempfile.mkdtemp()
-        tempfile.tempdir = jobs  # job dirs of the checks below land here: proves they are all removed
-        try:
-            assert run(A["users/43/ok"], {"text": "привет"}) == "текст: привет"
-            assert run(A["users/43/junk"], {}) == "ok"
+        assert run(A["users/43/ok"], {"text": "привет"}) == "текст: привет"
 
-            def fails(name, reason, **kw):
-                try:
-                    run(A[f"users/43/{name}"], {}, **kw)
-                except AdapterError as e:
-                    assert reason in e.reason, (name, e.reason)
-                    return e
-                raise AssertionError(f"{name} did not fail")
+        def fails(name, reason, **kw):
+            try:
+                run(A[f"users/43/{name}"], {}, **kw)
+            except AdapterError as e:
+                assert reason in e.reason, (name, e.reason)
+                return e
+            raise AssertionError(f"{name} did not fail")
 
-            assert "boom" in fails("crash", "exited with 5").detail
-            fails("none", "no transcript")
-            fails("blank", "empty")
-            fails("sleepy", "timeout", timeout=5)
-            fails("huge", "too large", max_bytes=1000)
-            fails("binary", "UTF-8")
-            fails("link", "no transcript")
-            fails("norun", "exited with")
-            assert os.listdir(jobs) == [], os.listdir(jobs)
-        finally:
-            tempfile.tempdir = None
-            _rm(jobs)
+        assert "boom" in fails("crash", "exited with 5").detail
+        fails("none", "empty")
+        fails("blank", "empty")
+        fails("sleepy", "timeout", timeout=5)
+        fails("huge", "too large", max_bytes=1000)
+        fails("norun", "exited with")
 
         # the image is named by content: stable while unchanged, new after an edit
         a = [x for x in mine if x.name == "users/42/tiktok"][0]
