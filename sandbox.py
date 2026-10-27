@@ -1,6 +1,17 @@
-import subprocess, uuid
+import os, subprocess, uuid
 
 from sidecar import sidecar
+
+
+BASE_IMAGE = "transcribe-base"
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapters", "base")
+
+
+def build_base():
+    """Adapter images are built FROM this one."""
+    r = subprocess.run(["docker", "build", "-q", "-t", BASE_IMAGE, BASE_DIR], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f"base image build failed: {r.stderr}")
 
 
 def run_sandboxed(image, cmd, workdir, timeout=300, net="none", env=None):

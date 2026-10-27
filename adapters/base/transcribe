@@ -1,0 +1,30 @@
+#!/usr/local/bin/python
+import argparse, glob, subprocess, sys, tempfile
+
+from openai import OpenAI
+
+MODEL = "gpt-4o-transcribe"
+CHUNK = 600  # seconds: keeps every request far below the 25 MB limit, whatever the input is
+# ponytail: fixed cut points can split a word; overlap the chunks and merge if it shows in practice
+
+ap = argparse.ArgumentParser()
+ap.add_argument("file")
+ap.add_argument("-l", "--language")
+args = ap.parse_args()
+
+with tempfile.TemporaryDirectory() as tmp:
+    ff = subprocess.run(["ffmpeg", "-v", "error", "-i", args.file, "-vn", "-ac", "1", "-ar", "16000",
+                         "-c:a", "libmp3lame", "-b:a", "32k", "-f", "segment", "-segment_time", str(CHUNK),
+                         f"{tmp}/c%04d.mp3"], capture_output=True, text=True)
+    if ff.returncode:
+        sys.exit(f"cannot extract audio from {args.file}: {ff.stderr.strip()}")
+    chunks = sorted(glob.glob(f"{tmp}/c*.mp3"))
+    if not chunks:
+        sys.exit(f"no audio in {args.file}")
+    client = OpenAI()
+    extra = {"language": args.language} if args.language else {}
+    texts = []
+    for c in chunks:
+        with open(c, "rb") as f:
+            texts.append(client.audio.transcriptions.create(model=MODEL, file=f, **extra).text.strip())
+print("\n".join(texts))
