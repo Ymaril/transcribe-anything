@@ -2,9 +2,10 @@
 
 OpenAI:   POST /openai/v1/audio/transcriptions (only allowed models)
 Telegram: /telegram/getFile and /telegram/file/<path> (download only)
-No auth: it is reachable only from the internal container network. A runaway container is stopped by its timeout.
+No auth: it listens on the loopback of the sidecar's network namespace, which only the sandboxed container
+of the same run shares. A runaway container is stopped by its timeout.
 """
-import re, threading, urllib.error, urllib.request
+import os, re, sys, threading, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 OPENAI_MODELS = {b"gpt-4o-transcribe", b"gpt-4o-mini-transcribe", b"whisper-1"}
@@ -76,7 +77,9 @@ class Proxy:
         return ThreadingHTTPServer((host, port), H)
 
 
-if __name__ == "__main__":  # self-check: python3 proxy.py
+if __name__ == "__main__" and sys.argv[1:] == ["serve"]:  # sidecar entry point: keys come from the environment
+    Proxy(os.environ["OPENAI_API_KEY"], os.environ["TELEGRAM_BOT_TOKEN"]).server("127.0.0.1", 8080).serve_forever()
+elif __name__ == "__main__":  # self-check: python3 sidecar/proxy.py
     seen = []
 
     class Fake(BaseHTTPRequestHandler):

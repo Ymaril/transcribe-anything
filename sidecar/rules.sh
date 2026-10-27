@@ -1,10 +1,12 @@
 #!/bin/sh
-# Egress filter for the network namespace shared by a sidecar and the sandboxed container.
+# Egress filter for the network namespace shared by the sidecar and the sandboxed container.
 # usage: rules.sh QUOTA_BYTES
 # Public internet is open; private ranges (host, LAN, other containers) are not.
 # Outbound bytes are capped: downloads are cheap (~0.5% of their size in ACKs), uploads are not.
 set -e
 iptables -A OUTPUT -o lo -j ACCEPT
+# the key proxy (uid 10001) talks only to OpenAI and Telegram: its traffic is neither filtered nor counted
+iptables -A OUTPUT -m owner --uid-owner 10001 -j ACCEPT
 for ns in $(awk '/^nameserver/{print $2}' /etc/resolv.conf); do
   iptables -A OUTPUT -d "$ns" -p udp --dport 53 -j ACCEPT
   iptables -A OUTPUT -d "$ns" -p tcp --dport 53 -j ACCEPT
