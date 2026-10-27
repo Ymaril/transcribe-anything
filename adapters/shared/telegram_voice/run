@@ -1,0 +1,22 @@
+#!/usr/local/bin/python
+import json, os, subprocess, sys, urllib.error, urllib.parse, urllib.request
+
+m = json.load(sys.stdin)
+proxy = os.environ["TB_PROXY"]
+
+
+def get(path, timeout):
+    return urllib.request.urlopen(proxy + path, timeout=timeout)
+
+
+try:
+    info = json.load(get("/telegram/getFile?" + urllib.parse.urlencode({"file_id": m["voice"]["file_id"]}), 60))
+    with open("/tmp/voice.oga", "wb") as f:
+        f.write(get("/telegram/file/" + info["result"]["file_path"], 120).read())
+except urllib.error.HTTPError as e:  # e.g. Telegram refuses files over 20 MB
+    sys.exit("Telegram refused the file: " + json.loads(e.read() or b"{}").get("description", str(e.code)))
+
+r = subprocess.run(["transcribe", "/tmp/voice.oga"], capture_output=True, text=True)
+if r.returncode:
+    sys.exit(r.stderr.strip()[-500:] or "transcribe failed")
+print(r.stdout)

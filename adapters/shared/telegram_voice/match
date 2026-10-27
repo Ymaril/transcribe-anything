@@ -1,0 +1,5 @@
+#!/usr/local/bin/python
+import json, sys
+
+m = json.load(sys.stdin)
+print(0.95 if "voice" in m else 0.0)
