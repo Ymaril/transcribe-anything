@@ -98,13 +98,21 @@ def status(update, text, every=5):
         ticker.join(10)
 
 
-def handle(message, tg, keys=None, root=dispatch.ROOT, allowed=None):
-    """One incoming message. tg has send(chat, text, reply_to) -> id, edit(chat, id, text), delete(chat, id)."""
+def start(message, tg, allowed=None):
+    """The instant part, run by the polling thread before the message waits for a free worker.
+    Returns the id of the status message, or None if the message is not for us."""
     user = message.get("from")
-    if not user or user.get("is_bot") or (allowed and user["id"] not in allowed):
-        return
-    chat, mid = message["chat"]["id"], message["message_id"]
-    progress = tg.send(chat, "Ищу подходящий адаптер…", mid)  # first of all: the user must see that we are alive
+    if not user or user.get("is_bot") or message["chat"].get("type") != "private":  # private chats only
+        return None
+    allow = not allowed or user["id"] in allowed
+    print(f"message from {user['id']} @{user.get('username', '-')}" + ("" if allow else " (ignored)"), flush=True)
+    return tg.send(message["chat"]["id"], "Ищу подходящий адаптер…", message["message_id"]) if allow else None
+
+
+def handle(message, progress, tg, keys=None, root=dispatch.ROOT):
+    """The rest of one message. progress is the id of the status message that start() sent.
+    tg has send(chat, text, reply_to) -> id, edit(chat, id, text), delete(chat, id)."""
+    user, chat, mid = message["from"], message["chat"]["id"], message["message_id"]
 
     def finish(text):
         tg.send(chat, text, mid)
@@ -139,13 +147,14 @@ def main():
     allowed = {int(x) for x in env.get("ALLOWED_USER_IDS", "").split(",") if x.strip()} or None
     tg = Telegram(token)
 
-    def safe(message):
+    def safe(message, progress):
         try:
-            handle(message, tg, keys, allowed=allowed)
+            handle(message, progress, tg, keys)
         except Exception:
             traceback.print_exc()
             try:
                 tg.send(message["chat"]["id"], "Что-то пошло не так.", message["message_id"])
+                tg.delete(message["chat"]["id"], progress)
             except Exception:
                 pass
 
@@ -153,7 +162,7 @@ def main():
     print(f"started as @{api(token, 'getMe')['username']}; "
           + (f"allowed users: {sorted(allowed)}" if allowed else "OPEN to everyone"), flush=True)
     offset = None
-    with ThreadPoolExecutor(4) as pool:
+    with ThreadPoolExecutor(64) as pool:  # threads are cheap: the container slots in dispatch limit the load
         while True:
             try:
                 updates = api(token, "getUpdates", {"timeout": 30, "offset": offset, "allowed_updates": ["message"]}, timeout=45)
@@ -169,8 +178,15 @@ def main():
                 continue
             for u in updates:
                 offset = u["update_id"] + 1
-                if "message" in u:
-                    pool.submit(safe, u["message"])
+                if "message" not in u:
+                    continue
+                try:
+                    progress = start(u["message"], tg, allowed)  # answered here, not when a worker gets free
+                except Exception:
+                    traceback.print_exc()
+                    continue
+                if progress:
+                    pool.submit(safe, u["message"], progress)
 
 
 class FakeTelegram:
@@ -251,12 +267,22 @@ def check():
             os.chmod(f"{d}/{name}", 0o755)
 
     def message(text, user=42, **extra):
-        return {"message_id": 5, "chat": {"id": 100 + user}, "from": {"id": user}, "text": text, **extra}
+        return {"message_id": 5, "chat": {"id": 100 + user, "type": "private"}, "from": {"id": user}, "text": text,
+                **extra}
+
+    def process(message, tg, allowed=None):  # what the polling loop and a worker do together
+        progress = start(message, tg, allowed)
+        if progress:
+            handle(message, progress, tg, root=root)
 
     try:
+        # the instant part alone: the status is out before any adapter work is done
+        tg = FakeTelegram()
+        assert start(message("hello"), tg) == 1 and tg.ops == [("send", 142, "Ищу подходящий адаптер…", 5, 1)], tg.ops
+
         # no adapters at all: the status comes first, then an honest answer; nothing is run
         tg = FakeTelegram()
-        handle(message("hello"), tg, root=root)
+        process(message("hello"), tg)
         assert tg.ops[0] == ("send", 142, "Ищу подходящий адаптер…", 5, 1), tg.ops
         assert tg.replies() == ["Не нашёл подходящий адаптер. Проверено адаптеров: 0."], tg.ops
         assert tg.ops[-1] == ("delete", 142, 1), tg.ops              # the status message is removed at the end
@@ -267,31 +293,32 @@ def check():
         adapter("users/42/bad_match", "raise SystemExit(2)", "print('never')")
 
         tg = FakeTelegram()
-        handle(message("hello"), tg, root=root)
+        process(message("hello"), tg)
         assert tg.replies() == ["world"], tg.ops
         assert ("edit", 142, 1, "Обрабатываю (shared/hello)…") in tg.ops, tg.ops   # the user sees which adapter works
 
         tg = FakeTelegram(fail_edit=True)                             # cosmetic failures do not cost the result
-        handle(message("hello"), tg, root=root)
+        process(message("hello"), tg)
         assert tg.replies() == ["world"], tg.ops
 
         tg = FakeTelegram()
-        handle(message("something else"), tg, root=root)
+        process(message("something else"), tg)
         assert len(tg.replies()) == 1 and "Проверено адаптеров: 3, из них с ошибкой: 1" in tg.replies()[0], tg.ops
 
         tg = FakeTelegram()
-        handle(message("break"), tg, root=root)
+        process(message("break"), tg)
         (reply,) = tg.replies()
         assert "users/42/broken" in reply and "exited with 4" in reply and "secret-detail" not in reply, reply
 
         # another user sees only the shared adapter; strangers, bots and non-users are ignored without any reply
         tg = FakeTelegram()
-        handle(message("break", user=7), tg, root=root)
+        process(message("break", user=7), tg)
         assert "Проверено адаптеров: 1." in tg.replies()[0], tg.ops
         tg = FakeTelegram()
-        handle(message("hello", user=8), tg, root=root, allowed={42})
-        handle({**message("hello"), "from": {"id": 9, "is_bot": True}}, tg, root=root)
-        handle({"message_id": 1, "chat": {"id": 1}, "text": "channel post"}, tg, root=root)
+        process(message("hello", user=8), tg, allowed={42})
+        process({**message("hello"), "from": {"id": 9, "is_bot": True}}, tg)
+        process({"message_id": 1, "chat": {"id": 1, "type": "channel"}, "text": "channel post"}, tg)
+        process({**message("hello"), "chat": {"id": -5, "type": "group"}}, tg)   # groups: private chats only
         assert tg.ops == [], tg.ops
     finally:
         import shutil

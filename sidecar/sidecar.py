@@ -1,6 +1,6 @@
 """Per-run sidecar: owns a network namespace and filters its egress. The sandboxed container joins that namespace.
 It also runs the key proxy on 127.0.0.1:8080, so the sandboxed container never holds real keys."""
-import os, subprocess, time, uuid
+import os, subprocess, threading, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMAGE = "tb-sidecar"
@@ -13,11 +13,26 @@ def docker(*args, env=None):
     return subprocess.run(["docker", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
 
 
+_image_lock, _image_ready = threading.Lock(), False
+
+
+def _build():
+    subprocess.run(["docker", "build", "-q", "-t", IMAGE, HERE], check=True, capture_output=True)
+
+
+def _ensure_image():
+    """Built once per process (the layer cache makes it quick): changed rules take effect after a restart."""
+    global _image_ready
+    with _image_lock:
+        if not _image_ready:
+            _build()
+            _image_ready = True
+
+
 def up(quota=QUOTA, keys=None):
     """Start a sidecar, apply the egress rules, start the key proxy if keys are given.
     Fails closed: if anything is wrong, no sidecar is left behind."""
-    # ponytail: rebuilt on every run (layer cache makes it a no-op); stale images would silently keep old rules
-    subprocess.run(["docker", "build", "-q", "-t", IMAGE, HERE], check=True, capture_output=True)
+    _ensure_image()
     name = f"tb-sc-{uuid.uuid4().hex[:12]}"
     r = docker("run", "-d", "--rm", "--name", name, "--cap-drop", "ALL", "--cap-add", "NET_ADMIN",
                "--security-opt", "no-new-privileges", "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",

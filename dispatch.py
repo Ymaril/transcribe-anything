@@ -5,7 +5,7 @@ They are utilities: the Telegram message (JSON) comes on stdin.
 match prints a confidence 0..1 (last non-empty line of stdout); run prints the transcript to stdout.
 stderr is for the log; scratch space is /tmp.
 """
-import hashlib, json, os, re, shutil, subprocess, tempfile
+import hashlib, json, os, re, shutil, subprocess, tempfile, threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -18,7 +18,14 @@ MATCH_OUTPUT = 64 * 1024
 BUILD_TIMEOUT = 600
 RUN_TIMEOUT = 900
 MAX_TRANSCRIPT = 2 * 1024 * 1024  # bytes
-PARALLEL = 3  # the machine has 4 cores; every match is a sidecar plus a container
+# Containers running at the same moment, over all messages (every one is a sidecar plus a container; 4 cores).
+# Short matches and long runs have separate slots: a long transcription must not stop other messages from matching.
+MATCH_SLOTS = 3
+RUN_SLOTS = 4
+_match_slots = threading.BoundedSemaphore(MATCH_SLOTS)
+_run_slots = threading.BoundedSemaphore(RUN_SLOTS)
+# ponytail: one lock for all builds: they are rare (first use of an adapter), and two messages never build the same image twice
+_build_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -74,22 +81,25 @@ def image_tag(adapter):
 
 def build(adapter):
     tag = image_tag(adapter)
-    if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0:
+    with _build_lock:
+        if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0:
+            return tag
+        with open(f"{adapter.path}/Dockerfile") as f:
+            if re.search(r"(?im)^\s*#\s*syntax\s*=", f.read()):  # would pull an arbitrary build frontend
+                raise ValueError("Dockerfile with a syntax directive is rejected")
+        r = subprocess.run(["docker", "build", "-q", "-t", tag, adapter.path],
+                           capture_output=True, text=True, timeout=BUILD_TIMEOUT)
+        if r.returncode:
+            raise RuntimeError(f"build failed: {r.stderr.strip()[-500:]}")
         return tag
-    with open(f"{adapter.path}/Dockerfile") as f:
-        if re.search(r"(?im)^\s*#\s*syntax\s*=", f.read()):  # would pull an arbitrary build frontend
-            raise ValueError("Dockerfile with a syntax directive is rejected")
-    r = subprocess.run(["docker", "build", "-q", "-t", tag, adapter.path],
-                       capture_output=True, text=True, timeout=BUILD_TIMEOUT)
-    if r.returncode:
-        raise RuntimeError(f"build failed: {r.stderr.strip()[-500:]}")
-    return tag
 
 
 def _match(adapter, message, keys):
     try:
-        r = sandbox.run_networked(build(adapter), ["/adapter/match"], json.dumps(message),
-                                  timeout=MATCH_TIMEOUT, keys=keys, max_output=MATCH_OUTPUT)
+        tag = build(adapter)
+        with _match_slots:
+            r = sandbox.run_networked(tag, ["/adapter/match"], json.dumps(message),
+                                      timeout=MATCH_TIMEOUT, keys=keys, max_output=MATCH_OUTPUT)
         if r.returncode:
             return Result(adapter, 0.0, f"match exited with {r.returncode}: {r.stderr.strip()[-200:]}")
         lines = [l for l in r.stdout.splitlines() if l.strip()]
@@ -109,7 +119,8 @@ def _match(adapter, message, keys):
 
 
 def match_all(adapters, message, keys=None):
-    with ThreadPoolExecutor(PARALLEL) as pool:
+    """All matches at once: the slots, not this pool, decide how many containers really run."""
+    with ThreadPoolExecutor(max(1, len(adapters))) as pool:
         return list(pool.map(lambda a: _match(a, message, keys), adapters))
 
 
@@ -120,8 +131,9 @@ def run(adapter, message, keys=None, timeout=RUN_TIMEOUT, max_bytes=MAX_TRANSCRI
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
         raise AdapterError("cannot build the adapter", str(e))
     try:
-        r = sandbox.run_networked(tag, ["/adapter/run"], json.dumps(message),
-                                  timeout=timeout, keys=keys, max_output=max_bytes)
+        with _run_slots:
+            r = sandbox.run_networked(tag, ["/adapter/run"], json.dumps(message),
+                                      timeout=timeout, keys=keys, max_output=max_bytes)
     except subprocess.TimeoutExpired:
         raise AdapterError("timeout")
     except sandbox.OutputTooLarge:
@@ -238,6 +250,46 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
             subprocess.run(["docker", "rmi", "-f", t], capture_output=True)
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(root2, ignore_errors=True)
+
+    # slots: however many messages arrive at once, only MATCH_SLOTS matches and RUN_SLOTS runs are in flight
+    import time
+
+    class Gauge:
+        def __init__(self):
+            self.now, self.top, self.lock = {"match": 0, "run": 0}, {"match": 0, "run": 0}, threading.Lock()
+
+        def __call__(self, image, cmd, stdin="", **kw):
+            kind = "match" if cmd[0] == "/adapter/match" else "run"
+            with self.lock:
+                self.now[kind] += 1
+                self.top[kind] = max(self.top[kind], self.now[kind])
+            time.sleep(0.3 if kind == "match" else 1.0)
+            with self.lock:
+                self.now[kind] -= 1
+            return sandbox.Completed(0, "0.9" if kind == "match" else "text", "")
+
+    gauge, real_run_networked, real_build = Gauge(), sandbox.run_networked, build
+    sandbox.run_networked, build = gauge, lambda a: "tag"
+    try:
+        fakes = [Adapter(f"/x/{i}", f"shared/a{i}", False) for i in range(5)]
+        with ThreadPoolExecutor(8) as ex:  # four messages at once, five adapters each
+            assert all(len(rs) == 5 for rs in ex.map(lambda _: match_all(fakes, {}), range(4)))
+        assert gauge.top["match"] == MATCH_SLOTS, gauge.top
+
+        with ThreadPoolExecutor(10) as ex:
+            assert list(ex.map(lambda _: run(fakes[0], {}), range(10))) == ["text"] * 10
+        assert gauge.top["run"] == RUN_SLOTS, gauge.top
+
+        # every run slot is busy for a second: a new message can still be matched meanwhile
+        with ThreadPoolExecutor(RUN_SLOTS) as ex:
+            futures = [ex.submit(run, fakes[0], {}) for _ in range(RUN_SLOTS)]
+            while gauge.now["run"] < RUN_SLOTS:
+                time.sleep(0.01)
+            assert len(match_all(fakes[:1], {})) == 1
+            assert gauge.now["run"] == RUN_SLOTS, "the match had to wait for the runs"
+            [f.result() for f in futures]
+    finally:
+        sandbox.run_networked, build = real_run_networked, real_build
 
     left = subprocess.run(["docker", "ps", "-aq", "--filter", "name=tb-"], capture_output=True, text=True).stdout
     assert not left.strip(), "containers left"
