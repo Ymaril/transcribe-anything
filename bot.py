@@ -3,14 +3,20 @@
 Message -> an instant status reply -> the user's own and shared adapters -> match -> best one -> run.
 The result is a new message (it notifies), the status message is removed.
 """
-import contextlib, os, sys, tempfile, threading, time, traceback
+import contextlib, os, shutil, sys, tempfile, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
-import dispatch, sandbox
-from sidecar import sidecar
+import agent, dispatch, sandbox
+from agent import AgentError
 from telegram_api import Telegram, TelegramError, api
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def adapter_keys(env):
+    """The keys the key proxy serves to adapters. The Anthropic key is deliberately not here: it is the agent's alone,
+    otherwise any adapter could spend it."""
+    return {k: env[k] for k in ("OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN")}
 
 
 def load_env(path=f"{HERE}/.env"):
@@ -68,9 +74,11 @@ BUTTONS = [("Да, проверить", "f"), ("Нет", "n")]
 _claimed, _claim_lock = set(), threading.Lock()  # questions already answered: a button can be pressed twice
 
 
-def handle(message, progress, tg, keys=None, root=dispatch.ROOT, foreign=False):
+def handle(message, progress, tg, keys=None, root=dispatch.ROOT, foreign=False, create=False, create_adapter=None):
     """The rest of one message. progress is the id of the status message that start() sent
     (or of the question the user has just answered). foreign=True: the user agreed to try other users' adapters.
+    create=True: the user declined, go straight to the last resort. create_adapter(user_id, message) ->
+    (adapter, transcript) is the agent, None if there is none; it raises AgentError.
     tg has send(chat, text, reply_to) -> id, ask(chat, text, reply_to, buttons) -> id, edit(chat, id, text),
     delete(chat, id)."""
     user, chat, mid = message["from"], message["chat"]["id"], message["message_id"]
@@ -82,6 +90,24 @@ def handle(message, progress, tg, keys=None, root=dispatch.ROOT, foreign=False):
         except Exception:
             pass
 
+    def last_resort(what):
+        """Nothing fits: the agent builds an adapter for this message, or we say that we cannot."""
+        if create_adapter is None:
+            return finish(f"{what} {NO_AGENT}".strip())
+        try:
+            with status(lambda s: tg.edit(chat, progress, s), "Создаю адаптер для такого сообщения"):
+                adapter, text = create_adapter(user["id"], message)
+        except AgentError as e:
+            print(f"agent: {e.reason}: {e.detail}", file=sys.stderr, flush=True)
+            return finish(f"Не получилось создать адаптер: {e.reason}.")
+        finish(text)
+        try:
+            tg.send(chat, f"Для таких сообщений создан адаптер {adapter.name}: в следующий раз он сработает сразу.", mid)
+        except Exception:
+            pass
+
+    if create:
+        return last_resort("")
     adapters = dispatch.foreign(user["id"], root) if foreign else dispatch.visible(user["id"], root)
     with status(lambda s: tg.edit(chat, progress, s), "Ищу подходящий адаптер"):
         results = dispatch.match_all(adapters, message, keys)
@@ -93,10 +119,10 @@ def handle(message, progress, tg, keys=None, root=dispatch.ROOT, foreign=False):
         failed = sum(1 for r in results if r.error)
         checked = f"Проверено адаптеров: {len(results)}" + (f", из них с ошибкой: {failed}" if failed else "")
         if foreign:
-            return finish(f"Среди адаптеров других пользователей тоже ничего не подошло. {checked}. {NO_AGENT}")
+            return last_resort(f"Среди адаптеров других пользователей тоже ничего не подошло. {checked}.")
         if dispatch.foreign(user["id"], root):  # there is somebody else's adapter to try, but only with consent
             return finish(ASK_FOREIGN.format(checked=checked), BUTTONS)
-        return finish(f"Не нашёл подходящий адаптер. {checked}. {NO_AGENT}")
+        return last_resort(f"Не нашёл подходящий адаптер. {checked}.")
     try:
         with status(lambda s: tg.edit(chat, progress, s), f"Обрабатываю ({best.adapter.name})"):
             text = dispatch.run(best.adapter, message, keys)
@@ -106,7 +132,7 @@ def handle(message, progress, tg, keys=None, root=dispatch.ROOT, foreign=False):
     finish(text)
 
 
-def on_callback(cb, tg, keys=None, root=dispatch.ROOT, allowed=None):
+def on_callback(cb, tg, keys=None, root=dispatch.ROOT, allowed=None, create_adapter=None):
     """A button under our question. The question is a reply to the user's message, so Telegram hands the original
     message back inside the callback: no state is kept for this."""
     try:
@@ -127,21 +153,27 @@ def on_callback(cb, tg, keys=None, root=dispatch.ROOT, allowed=None):
             return
         _claimed.add((chat, question))
     if cb.get("data") == "f":
-        handle(original, question, tg, keys, root, foreign=True)
-    else:
+        handle(original, question, tg, keys, root, foreign=True, create_adapter=create_adapter)
+    elif create_adapter is None:
         tg.edit(chat, question, f"Хорошо. {NO_AGENT}")
+    else:
+        handle(original, question, tg, keys, root, create=True, create_adapter=create_adapter)
 
 
 def main():
     env = load_env()
     token = env["TELEGRAM_BOT_TOKEN"]
-    keys = {k: env[k] for k in sidecar.KEY_NAMES}
+    keys = adapter_keys(env)
     allowed = {int(x) for x in env.get("ALLOWED_USER_IDS", "").split(",") if x.strip()} or None
     tg = Telegram(token)
+    create_adapter = None
+    if env.get("ANTHROPIC_API_KEY") and allowed:  # the agent costs money: only for a closed circle of users
+        agent_keys = {**keys, "ANTHROPIC_API_KEY": env["ANTHROPIC_API_KEY"]}
+        create_adapter = lambda uid, message: agent.create(uid, message, agent_keys, keys)
 
     def safe(message, progress):
         try:
-            handle(message, progress, tg, keys)
+            handle(message, progress, tg, keys, create_adapter=create_adapter)
         except Exception:
             traceback.print_exc()
             try:
@@ -152,13 +184,17 @@ def main():
 
     def safe_callback(cb):
         try:
-            on_callback(cb, tg, keys, allowed=allowed)
+            on_callback(cb, tg, keys, allowed=allowed, create_adapter=create_adapter)
         except Exception:
             traceback.print_exc()
 
     sandbox.build_base()
+    if create_adapter:
+        print("building the agent image (minutes the first time)...", flush=True)
+        agent.ensure_image()
     print(f"started as @{api(token, 'getMe')['username']}; "
-          + (f"allowed users: {sorted(allowed)}" if allowed else "OPEN to everyone"), flush=True)
+          + (f"allowed users: {sorted(allowed)}" if allowed else "OPEN to everyone")
+          + ("; agent on" if create_adapter else "; agent off (needs ANTHROPIC_API_KEY and ALLOWED_USER_IDS)"), flush=True)
     offset = None
     with ThreadPoolExecutor(64) as pool:  # threads are cheap: the container slots in dispatch limit the load
         while True:
@@ -223,6 +259,10 @@ class FakeTelegram:
 
 
 def check():
+    # the Anthropic key never goes to adapters
+    keys = adapter_keys({"OPENAI_API_KEY": "o", "TELEGRAM_BOT_TOKEN": "t", "ANTHROPIC_API_KEY": "a", "OTHER": "x"})
+    assert keys == {"OPENAI_API_KEY": "o", "TELEGRAM_BOT_TOKEN": "t"}, keys
+
     # routing of updates: no adapters, no docker, only who gets what
     got = []
     private = {"message_id": 5, "chat": {"id": 142, "type": "private"}, "from": {"id": 42}, "text": "hi"}
@@ -381,8 +421,51 @@ def check():
         on_callback(pressed("f", original=message("nobody"), question=15), tg, root=root)
         assert sent(tg) == ["Среди адаптеров других пользователей тоже ничего не подошло. Проверено адаптеров: 1. "
                             + NO_AGENT], tg.ops
+
+        # the last resort: the agent builds an adapter, or fails honestly
+        made = dispatch.Adapter("/x/users/42/new_one", "users/42/new_one", True)
+        asked_agent = []
+
+        def good_agent(uid, m):
+            asked_agent.append((uid, m))
+            return made, "the transcript"
+
+        def bad_agent(uid, m):
+            raise AgentError("the adapter did not pass the acceptance", "details for the log")
+
+        empty = tempfile.mkdtemp()                                             # nobody has any adapter: no question to ask
+        lonely = message("something nobody handles")
+        tg = FakeTelegram()
+        handle(lonely, start(lonely, tg), tg, root=empty, create_adapter=good_agent)
+        assert asked_agent == [(42, lonely)], asked_agent
+        assert sent(tg)[1] == "the transcript" and "создан адаптер users/42/new_one" in sent(tg)[2], tg.ops
+        assert ("edit", 142, 1, "Создаю адаптер для такого сообщения…") in tg.ops and ("delete", 142, 1) in tg.ops, tg.ops
+
+        tg = FakeTelegram()
+        handle(lonely, start(lonely, tg), tg, root=empty, create_adapter=bad_agent)
+        assert sent(tg)[1:] == ["Не получилось создать адаптер: the adapter did not pass the acceptance."], tg.ops
+        assert "details" not in "".join(sent(tg)), "details of the failure leaked to the user"
+
+        asked_agent.clear()                                                    # others' adapters exist: ask first
+        tg = FakeTelegram()
+        handle(lonely, start(lonely, tg), tg, root=root, create_adapter=good_agent)
+        assert asked_agent == [] and any(len(o) == 6 for o in tg.ops), tg.ops  # a question, no agent yet
+
+        tg = FakeTelegram()                                                    # "No": straight to the agent
+        on_callback(pressed("n", original=lonely, question=20), tg, root=root, create_adapter=good_agent)
+        assert asked_agent == [(42, lonely)] and sent(tg)[0] == "the transcript", tg.ops
+
+        asked_agent.clear()                                                    # "Yes", nothing there either: the agent
+        tg = FakeTelegram()
+        on_callback(pressed("f", original=message("nobody"), question=21), tg, root=root, create_adapter=good_agent)
+        assert len(asked_agent) == 1 and sent(tg)[0] == "the transcript", tg.ops
+
+        asked_agent.clear()                                                    # "Yes", and a stranger's adapter fits
+        tg = FakeTelegram()
+        on_callback(pressed("f", original=message("stranger-only"), question=22), tg, root=root, create_adapter=good_agent)
+        assert asked_agent == [] and sent(tg) == ["from stranger"], tg.ops
+        shutil.rmtree(empty)
     finally:
-        import shutil
         for a in dispatch.visible(42, root) + dispatch.foreign(42, root):
             os.system(f"docker rmi -f {dispatch.image_tag(a)} >/dev/null 2>&1")
         shutil.rmtree(root, ignore_errors=True)

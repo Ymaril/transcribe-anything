@@ -3,7 +3,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-for c in "sidecar/proxy.py" "telegram_api.py" "sandbox.py" "check_base.py" "dispatch.py" "check_voice_adapter.py" "bot.py --check"; do
+for c in "sidecar/proxy.py" "telegram_api.py" "sandbox.py" "check_base.py" "dispatch.py" "agent.py" "check_voice_adapter.py" "bot.py --check"; do
   if out=$(python3 $c 2>&1); then
     echo "ok      $c"
   else

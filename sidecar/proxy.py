@@ -1,6 +1,8 @@
 """Key-injecting proxy: sandboxed code calls it, never sees real keys.
 
 OpenAI:   POST /openai/v1/audio/transcriptions (only allowed models)
+Anthropic: POST /anthropic/v1/messages and /count_tokens (sonnet and haiku models only), streamed through. Only the
+          agent's sidecar is given this key: other sidecars answer 403 on this route.
 Telegram: /telegram/getFile and /telegram/file/<path> (download only). Telegram numbers files sequentially, so a
           real file_path could be guessed to reach the neighbours' files. The file_path in the getFile answer is
           therefore replaced by an opaque token (encrypted and signed with a key that lives in this process only);
@@ -15,13 +17,17 @@ OPENAI_MODELS = {b"gpt-4o-transcribe", b"gpt-4o-mini-transcribe", b"whisper-1"}
 MAX_BODY = 30 * 1024 * 1024
 TG_PATH = re.compile(r"^[A-Za-z0-9_\-./]+$")
 TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
+ANTHROPIC_PATHS = {"/anthropic/v1/messages", "/anthropic/v1/messages/count_tokens"}
+ANTHROPIC_MODEL = re.compile(r"^claude-(sonnet|haiku)-[A-Za-z0-9.\-]+$")  # not the expensive families
+ANTHROPIC_FORWARD = ("anthropic-version", "anthropic-beta", "accept")
 
 
 class Proxy:
     def __init__(self, openai_key, telegram_token,
-                 openai_base="https://api.openai.com", telegram_base="https://api.telegram.org"):
-        self.openai_key, self.telegram_token = openai_key, telegram_token
-        self.openai_base, self.telegram_base = openai_base, telegram_base
+                 openai_base="https://api.openai.com", telegram_base="https://api.telegram.org",
+                 anthropic_key=None, anthropic_base="https://api.anthropic.com"):
+        self.openai_key, self.telegram_token, self.anthropic_key = openai_key, telegram_token, anthropic_key
+        self.openai_base, self.telegram_base, self.anthropic_base = openai_base, telegram_base, anthropic_base
         master = os.urandom(32)  # lives in memory only: tokens are valid for this proxy (this run) and nowhere else
         self.enc_key = hmac.new(master, b"enc", hashlib.sha256).digest()
         self.mac_key = hmac.new(master, b"mac", hashlib.sha256).digest()
@@ -67,13 +73,23 @@ class Proxy:
         path, _, query = path.partition("?")
         if path == "/openai/v1/audio/transcriptions" and method == "POST":
             m = re.search(rb'name="model"\r\n\r\n([^\r]+)\r\n', body)
-            if not m or m.group(1) not in OPENAI_MODELS:
+            if not self.openai_key or not m or m.group(1) not in OPENAI_MODELS:
                 return 403
             return (self.openai_base + path[len("/openai"):],
                     {"Authorization": f"Bearer {self.openai_key}"})
-        if path == "/telegram/getFile":
+        if path in ANTHROPIC_PATHS and method == "POST":
+            try:
+                model = json.loads(body)["model"]
+            except (ValueError, KeyError, TypeError):
+                return 403
+            if not self.anthropic_key or not isinstance(model, str) or not ANTHROPIC_MODEL.match(model):
+                return 403
+            # the query goes along: Claude Code calls /v1/messages?beta=true
+            return (self.anthropic_base + path[len("/anthropic"):] + (f"?{query}" if query else ""),
+                    {"x-api-key": self.anthropic_key})
+        if path == "/telegram/getFile" and self.telegram_token:
             return f"{self.telegram_base}/bot{self.telegram_token}/getFile?{query}", {}
-        if path.startswith("/telegram/file/"):
+        if path.startswith("/telegram/file/") and self.telegram_token:
             rest = path[len("/telegram/file/"):]
             if ".." in rest:
                 return 400
@@ -106,6 +122,9 @@ class Proxy:
                 url, headers = r
                 if ct := self.headers.get("Content-Type"):
                     headers["Content-Type"] = ct
+                for name in ANTHROPIC_FORWARD if self.path.startswith("/anthropic/") else ():
+                    if value := self.headers.get(name):
+                        headers[name] = value
                 req = urllib.request.Request(url, data=body or None, headers=headers, method=self.command)
                 try:
                     up = urllib.request.urlopen(req, timeout=300)
@@ -120,7 +139,7 @@ class Proxy:
                 self.end_headers()
                 if hide:
                     return self.wfile.write(answer)
-                while chunk := up.read(65536):
+                while chunk := up.read1(65536):  # read1: hand over what has arrived, do not wait for a full block (SSE)
                     self.wfile.write(chunk)
 
             do_GET = do_POST = handle_any
@@ -129,9 +148,11 @@ class Proxy:
 
 
 if __name__ == "__main__" and sys.argv[1:] == ["serve"]:  # sidecar entry point: keys come from the environment
-    Proxy(os.environ["OPENAI_API_KEY"], os.environ["TELEGRAM_BOT_TOKEN"]).server("127.0.0.1", 8080).serve_forever()
+    Proxy(os.environ.get("OPENAI_API_KEY"), os.environ.get("TELEGRAM_BOT_TOKEN"),
+          anthropic_key=os.environ.get("ANTHROPIC_API_KEY")).server("127.0.0.1", 8080).serve_forever()
 elif __name__ == "__main__":  # self-check: python3 sidecar/proxy.py
-    seen = []
+    import time
+    seen, headers_seen = [], []
     REAL = {"file_id": "abc", "file_unique_id": "u1", "file_size": 1234, "file_path": "voice/file_1.ogg"}
     GETFILE = json.dumps({"ok": True, "result": REAL}).encode()
     ERROR = json.dumps({"ok": False, "error_code": 400, "description": "Bad Request: file is too big"}).encode()
@@ -141,7 +162,18 @@ elif __name__ == "__main__":  # self-check: python3 sidecar/proxy.py
 
         def handle_any(self):
             n = int(self.headers.get("Content-Length") or 0)
-            seen.append((self.command, self.path, self.headers.get("Authorization"), self.rfile.read(n)))
+            body = self.rfile.read(n)
+            seen.append((self.command, self.path, self.headers.get("Authorization"), body))
+            headers_seen.append({k.lower(): v for k, v in self.headers.items()})
+            if self.path == "/v1/messages" and b'"stream"' in body:  # server-sent events, in two parts
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: one\n\n")
+                self.wfile.flush()
+                time.sleep(0.8)
+                self.wfile.write(b"data: two\n\n")
+                return
             refused = "file_id=big" in self.path
             self.send_response(400 if refused else 200)
             self.send_header("Content-Type", "text/plain")
@@ -158,10 +190,10 @@ elif __name__ == "__main__":  # self-check: python3 sidecar/proxy.py
         threading.Thread(target=s.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_address[1]}"
 
-    def call(method, path, body=None, ctype=None):
-        h = {"Content-Type": ctype} if ctype else {}
+    def call(method, path, body=None, ctype=None, headers=None, to=None):
+        h = {**({"Content-Type": ctype} if ctype else {}), **(headers or {})}
         try:
-            r = urllib.request.urlopen(urllib.request.Request(url + path, data=body, headers=h, method=method))
+            r = urllib.request.urlopen(urllib.request.Request((to or url) + path, data=body, headers=h, method=method))
             return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
@@ -204,5 +236,42 @@ elif __name__ == "__main__":  # self-check: python3 sidecar/proxy.py
     assert call("POST", "/telegram/sendMessage", b"x")[0] == 403
     assert call("GET", "/telegram/file/../getUpdates")[0] == 400
     assert len(seen) == n, "rejected requests reached upstream"
+
+    # Anthropic: this proxy has no key for it (an ordinary sidecar): refused, nothing reaches upstream
+    AJ, AM = "application/json", "/anthropic/v1/messages"
+    sonnet = json.dumps({"model": "claude-sonnet-5-5", "max_tokens": 1, "messages": []}).encode()
+    assert call("POST", AM, sonnet, AJ)[0] == 403 and len(seen) == n
+
+    # ... and the agent's sidecar has one: the key is added by the proxy, only sonnet/haiku, only the messages routes
+    claude = Proxy("k", "t", base, base, anthropic_key="ak-real", anthropic_base=base)
+    csrv = claude.server("127.0.0.1", 0)
+    threading.Thread(target=csrv.serve_forever, daemon=True).start()
+    cu = f"http://127.0.0.1:{csrv.server_address[1]}"
+    sent = {"x-api-key": "evil", "anthropic-version": "2023-06-01", "anthropic-beta": "b1", "authorization": "Bearer evil"}
+    assert call("POST", AM, sonnet, AJ, sent, cu) == (200, b"upstream-ok")
+    assert seen[-1][1] == "/v1/messages" and seen[-1][2] is None, seen[-1]
+    h = headers_seen[-1]
+    assert h["x-api-key"] == "ak-real" and h["anthropic-version"] == "2023-06-01" and h["anthropic-beta"] == "b1", h
+    assert call("POST", AM + "/count_tokens", sonnet, AJ, None, cu)[0] == 200 and seen[-1][1] == "/v1/messages/count_tokens"
+    assert call("POST", AM + "?beta=true", sonnet, AJ, None, cu)[0] == 200 and seen[-1][1] == "/v1/messages?beta=true", seen[-1]
+    n = len(seen)
+    for model in ("claude-opus-5-5", "claude-fable-5-1", "gpt-4o", "claude-sonnet-5-5/../../x", "", None, 5):
+        body = json.dumps({"model": model, "messages": []}).encode()
+        assert call("POST", AM, body, AJ, None, cu)[0] == 403, model
+    assert call("POST", AM, b"not json", AJ, None, cu)[0] == 403 and call("POST", AM, b"[]", AJ, None, cu)[0] == 403
+    for other_path in ("/anthropic/v1/complete", "/anthropic/v1/models", "/anthropic/v1/messages/batches", "/anthropic/"):
+        assert call("POST", other_path, sonnet, AJ, None, cu)[0] == 403, other_path
+    assert call("GET", AM, None, None, None, cu)[0] == 403
+    assert len(seen) == n, "a rejected Anthropic request reached upstream"
+
+    # a streamed answer is handed over as it arrives, not when it is complete
+    stream = json.dumps({"model": "claude-haiku-5-5", "stream": True, "messages": []}).encode()
+    t0 = time.time()
+    r = urllib.request.urlopen(urllib.request.Request(cu + AM, data=stream, headers={"Content-Type": AJ}, method="POST"))
+    first = r.read(len(b"data: one\n\n"))
+    t_first = time.time() - t0
+    rest = r.read()
+    assert first == b"data: one\n\n" and rest == b"data: two\n\n", (first, rest)
+    assert t_first < 0.5 and time.time() - t0 >= 0.7, (t_first, time.time() - t0)
 
     print("ok")

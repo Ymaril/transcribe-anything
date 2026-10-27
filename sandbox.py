@@ -25,6 +25,10 @@ def image_exists(tag):
     return subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0
 
 
+def remove_image(tag):
+    subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+
+
 def build_image(tag, directory, timeout=None):
     """Build an image from a directory. Raises RuntimeError with the tail of docker's complaint."""
     r = subprocess.run(["docker", "build", "-q", "-t", tag, directory], capture_output=True, text=True, timeout=timeout)
@@ -37,19 +41,23 @@ def build_base():
     build_image(BASE_IMAGE, BASE_DIR)
 
 
-def run_sandboxed(image, cmd, stdin="", timeout=300, net="none", env=None, max_output=MAX_OUTPUT):
+def run_sandboxed(image, cmd, stdin="", timeout=300, net="none", env=None, max_output=MAX_OUTPUT,
+                  mounts=None, user="65534:65534", memory="1g", tmp="512m", workdir="/tmp"):
     """Run cmd from image in a throwaway container. Scratch space is /tmp (tmpfs).
-    net: "none" or "container:<sidecar>" (see sidecar.up). Raises subprocess.TimeoutExpired, OutputTooLarge."""
+    net: "none" or "container:<sidecar>" (see sidecar.up). Raises subprocess.TimeoutExpired, OutputTooLarge.
+    The last five are for the agent, the only container that gets a directory to write to (mounts: {host: container}),
+    a larger budget, and the host's uid so that what it writes is ours to read, move and delete."""
     data = stdin.encode()
     if len(data) > MAX_INPUT:
         raise ValueError("input is too large")
     name = f"tb-{uuid.uuid4().hex[:12]}"
     args = ["docker", "run", "--rm", "-i", "--name", name, "--network", net,
-            "--read-only", "--tmpfs", "/tmp:size=512m", "--cap-drop", "ALL",
+            "--read-only", "--tmpfs", f"/tmp:size={tmp}", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--pids-limit", "256",
-            "--memory", "1g", "--cpus", "1", "--user", "65534:65534",
+            "--memory", memory, "--cpus", "1", "--user", user,
             "-e", "HOME=/tmp", *[a for k, v in (env or {}).items() for a in ("-e", f"{k}={v}")],
-            "-w", "/tmp", image, *cmd]
+            *[a for host, inside in (mounts or {}).items() for a in ("-v", f"{host}:{inside}")],
+            "-w", workdir, image, *cmd]
     p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, tail, too_big = bytearray(), collections.deque(maxlen=4096), []
 
@@ -92,13 +100,15 @@ def run_sandboxed(image, cmd, stdin="", timeout=300, net="none", env=None, max_o
     return Completed(p.returncode, out.decode("utf-8", "replace"), bytes(tail).decode("utf-8", "replace"))
 
 
-def run_networked(image, cmd, stdin="", timeout=300, quota=sidecar.QUOTA, keys=None, max_output=MAX_OUTPUT):
-    """Like run_sandboxed, but with filtered internet access.
-    keys (OPENAI_API_KEY, TELEGRAM_BOT_TOKEN): served by the key proxy, the container only gets its address."""
+def run_networked(image, cmd, stdin="", timeout=300, quota=sidecar.QUOTA, keys=None, max_output=MAX_OUTPUT,
+                  env=None, **options):
+    """Like run_sandboxed, but with filtered internet access (options: see run_sandboxed).
+    keys (see sidecar.KEY_NAMES): served by the key proxy, the container only gets its address."""
     sc = sidecar.up(quota, keys)
-    env = sidecar.env() if keys else None
+    env = {**(sidecar.env() if keys else {}), **(env or {})}
     try:
-        return run_sandboxed(image, cmd, stdin, timeout, net=f"container:{sc}", env=env, max_output=max_output)
+        return run_sandboxed(image, cmd, stdin, timeout, net=f"container:{sc}", env=env, max_output=max_output,
+                             **options)
     finally:
         sidecar.down(sc)
 
@@ -116,6 +126,17 @@ if __name__ == "__main__":  # self-check: python3 sandbox.py (needs internet)
     assert run_sandboxed(IMG, ["sh", "-c", "touch /tmp/ok"]).returncode == 0, "/tmp is not writable"
     assert run_sandboxed(IMG, ["sh", "-c", "touch /etc/x"]).returncode != 0, "root fs is writable"
     assert run_sandboxed(IMG, ["sh", "-c", "touch /work/x"]).returncode != 0, "there must be no /work"
+
+    # the agent's way: a directory to write to, the host's uid, a bigger budget: what it writes is ours
+    import shutil
+    mine = tempfile.mkdtemp()
+    me = f"{os.getuid()}:{os.getgid()}"
+    r = run_sandboxed(IMG, ["sh", "-c", "echo hi > f && mkdir sub && echo x > sub/g && df -m /tmp | tail -1"],
+                      mounts={mine: "/adapter"}, user=me, workdir="/adapter", memory="2g", tmp="768m")
+    assert r.returncode == 0, r.stderr
+    assert open(f"{mine}/f").read() == "hi\n" and os.stat(f"{mine}/f").st_uid == os.getuid()
+    assert " 768 " in r.stdout, r.stdout                                      # the larger /tmp
+    shutil.rmtree(mine)                                                       # ours to delete, no root helper needed
 
     # stdin in, stdout/stderr out
     r = run_sandboxed(IMG, ["sh", "-c", "cat; echo err >&2; exit 3"], stdin="привет\n")
@@ -215,10 +236,13 @@ print(json.dumps({
     "big_upload_reached": call("POST", TR, form(b"whisper-1", 300_000), MP),
     "bad_model": call("POST", TR, form(b"gpt-4o"), MP),
     "send_message": call("POST", "/telegram/sendMessage", b"x"),
-    "env_has_key": any("bogus" in v for v in os.environ.values()),
+    "anthropic": call("POST", "/anthropic/v1/messages", json.dumps({"model": "claude-haiku-5-5", "messages": []}).encode(),
+                      "application/json"),
+    "env_has_key": any("bogus" in v or "from-host" in v for v in os.environ.values()),
     "base_url": os.environ["OPENAI_BASE_URL"],
 }))
 """
+    os.environ["ANTHROPIC_API_KEY"] = "sk-ant-from-host-env"  # lying in our own environment: must never reach an adapter
     sc = sidecar.up(quota=5000, keys=keys)  # quota is far below the big upload: only the exemption lets it through
     try:
         env = sidecar.env()
@@ -226,7 +250,8 @@ print(json.dumps({
         assert r.returncode == 0, r.stderr
         got = json.loads(r.stdout)
         assert got == {"tg_reached": 401, "openai_reached": 401, "big_upload_reached": 401, "bad_model": 403,
-                       "send_message": 403, "env_has_key": False, "base_url": env["OPENAI_BASE_URL"]}, got
+                       "send_message": 403, "anthropic": 403, "env_has_key": False,
+                       "base_url": env["OPENAI_BASE_URL"]}, got
         rules = docker("exec", sc, "iptables", "-L", "OUTPUT", "-v", "-x", "-n").stdout.splitlines()
         proxy_rule = [l.split() for l in rules if "owner UID match 10001" in l][0]
         drop_all = [l.split() for l in rules if l.split()[2:3] == ["DROP"] and l.split()[-2:] == ["0.0.0.0/0"] * 2][0]
@@ -240,6 +265,19 @@ print(json.dumps({
         assert other.returncode != 0, "key proxy is reachable from outside the sidecar"
     finally:
         sidecar.down(sc)
+        del os.environ["ANTHROPIC_API_KEY"]
+
+    # the agent's sidecar is given the Anthropic key: the request reaches Anthropic (401 for a bogus key)
+    agent_probe = """
+import json, os, urllib.error, urllib.request
+req = urllib.request.Request(os.environ["ANTHROPIC_BASE_URL"] + "/v1/messages", method="POST",
+    data=json.dumps({"model": "claude-haiku-5-5", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+    headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+try: print(urllib.request.urlopen(req, timeout=60).status)
+except urllib.error.HTTPError as e: print(e.code)
+"""
+    r = run_networked(IMG, ["python", "-"], agent_probe, keys={**keys, "ANTHROPIC_API_KEY": "sk-ant-bogus"})
+    assert r.stdout.strip() == "401", (r.stdout, r.stderr)
 
     # run_networked passes the proxy address to the container and cleans up
     r = run_networked(IMG, ["python", "-c", "import os; print(os.environ['TB_PROXY'], os.environ['OPENAI_API_KEY'])"],

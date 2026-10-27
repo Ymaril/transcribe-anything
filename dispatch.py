@@ -50,8 +50,9 @@ class AdapterError(Exception):
 
 
 def _dirs(path):
+    """Subdirectories, except hidden ones: the agent works in users/<id>/.staging, unfinished adapters stay unseen."""
     return sorted(os.path.join(path, n) for n in os.listdir(path)
-                  if os.path.isdir(os.path.join(path, n))) if os.path.isdir(path) else []
+                  if not n.startswith(".") and os.path.isdir(os.path.join(path, n))) if os.path.isdir(path) else []
 
 
 def visible(user_id, root=ROOT):
@@ -189,6 +190,8 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
     adapter("users/7/stranger_voice", "print(0.95 if 'voice' in m else 0.0)")
     adapter("users/42/same_as_shared", "print(0.9 if 'voice' in m else 0.0)")
     open(f"{root}/shared/README", "w").write("not an adapter")
+    os.makedirs(f"{root}/users/42/.staging/abc")             # an unfinished adapter of the agent: not an adapter yet
+    os.makedirs(f"{root}/users/.hidden/x")
 
     names = lambda xs: sorted(a.name for a in xs)
     assert names(visible(42, root)) == ["shared/voice", "users/42/broken", "users/42/chatty", "users/42/crash",

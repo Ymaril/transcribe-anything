@@ -6,7 +6,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 IMAGE = "tb-sidecar"
 QUOTA = 5 * 1024 * 1024  # outbound bytes per run
 PROXY_URL = "http://127.0.0.1:8080"
-KEY_NAMES = ("OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN")
+KEY_NAMES = ("OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY")  # the last one is for the agent only
 
 
 def docker(*args, env=None):
@@ -15,7 +15,8 @@ def docker(*args, env=None):
 
 def env():
     """What a container in the sidecar's network namespace is told about the key proxy (the address, never a key)."""
-    return {"OPENAI_BASE_URL": f"{PROXY_URL}/openai/v1", "OPENAI_API_KEY": "unused", "TB_PROXY": PROXY_URL}
+    return {"OPENAI_BASE_URL": f"{PROXY_URL}/openai/v1", "OPENAI_API_KEY": "unused",
+            "ANTHROPIC_BASE_URL": f"{PROXY_URL}/anthropic", "ANTHROPIC_API_KEY": "unused", "TB_PROXY": PROXY_URL}
 
 
 _image_lock, _image_ready = threading.Lock(), False
@@ -57,10 +58,11 @@ def up(quota=QUOTA, keys=None):
 
 
 def _start_proxy(name, keys):
-    # keys go through the environment of the docker client (-e NAME without value), not the command line
-    env = {**os.environ, **{k: keys[k] for k in KEY_NAMES}}
-    r = docker("exec", "-d", "--user", "10001", *[a for k in KEY_NAMES for a in ("-e", k)],
-               name, "python3", "/proxy.py", "serve", env=env)
+    # keys go through the environment of the docker client (-e NAME without value), not the command line;
+    # only the keys we were given: a key that happens to sit in our own environment must not slip in
+    given = [k for k in KEY_NAMES if keys.get(k)]
+    r = docker("exec", "-d", "--user", "10001", *[a for k in given for a in ("-e", k)],
+               name, "python3", "/proxy.py", "serve", env={**os.environ, **{k: keys[k] for k in given}})
     if r.returncode:
         raise RuntimeError(f"proxy start failed: {r.stderr}")
     ping = "import socket; socket.create_connection(('127.0.0.1', 8080), 1)"
