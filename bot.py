@@ -64,13 +64,13 @@ def start(message, tg, allowed=None):
         return None
     allow = not allowed or user["id"] in allowed
     print(f"message from {user['id']} @{user.get('username', '-')}" + ("" if allow else " (ignored)"), flush=True)
-    return tg.send(message["chat"]["id"], "Ищу подходящий адаптер…", message["message_id"]) if allow else None
+    return tg.send(message["chat"]["id"], "Looking for a suitable adapter…", message["message_id"]) if allow else None
 
 
-NO_AGENT = "Создавать новые адаптеры я пока не умею."
-ASK_FOREIGN = ("Не нашёл подходящий адаптер среди ваших и проверенных. {checked}. Могу поискать среди адаптеров других "
-               "пользователей. Они не проверены, и даже сама проверка может передать им ваше сообщение и вложения. Проверить?")
-BUTTONS = [("Да, проверить", "f"), ("Нет", "n")]
+NO_AGENT = "I cannot create new adapters yet."
+ASK_FOREIGN = ("No suitable adapter among yours and the verified ones. {checked}. I can look among other users' "
+               "adapters. They are not verified, and even matching may hand them your message and attachments. Check?")
+BUTTONS = [("Yes, check", "f"), ("No", "n")]
 _claimed, _claim_lock = set(), threading.Lock()  # questions already answered: a button can be pressed twice
 
 
@@ -95,21 +95,21 @@ def handle(message, progress, tg, keys=None, root=dispatch.ROOT, foreign=False, 
         if create_adapter is None:
             return finish(f"{what} {NO_AGENT}".strip())
         try:
-            with status(lambda s: tg.edit(chat, progress, s), "Создаю адаптер для такого сообщения"):
+            with status(lambda s: tg.edit(chat, progress, s), "Creating an adapter for this kind of message"):
                 adapter, text = create_adapter(user["id"], message)
         except AgentError as e:
             print(f"agent: {e.reason}: {e.detail}", file=sys.stderr, flush=True)
-            return finish(f"Не получилось создать адаптер: {e.reason}.")
+            return finish(f"Could not create an adapter: {e.reason}.")
         finish(text)
         try:
-            tg.send(chat, f"Для таких сообщений создан адаптер {adapter.name}: в следующий раз он сработает сразу.", mid)
+            tg.send(chat, f"Created adapter {adapter.name} for messages like this: next time it will work right away.", mid)
         except Exception:
             pass
 
     if create:
         return last_resort("")
     adapters = dispatch.foreign(user["id"], root) if foreign else dispatch.visible(user["id"], root)
-    with status(lambda s: tg.edit(chat, progress, s), "Ищу подходящий адаптер"):
+    with status(lambda s: tg.edit(chat, progress, s), "Looking for a suitable adapter"):
         results = dispatch.match_all(adapters, message, keys)
     for r in results:
         if r.error:
@@ -117,18 +117,18 @@ def handle(message, progress, tg, keys=None, root=dispatch.ROOT, foreign=False, 
     best = dispatch.pick(results)
     if not best:
         failed = sum(1 for r in results if r.error)
-        checked = f"Проверено адаптеров: {len(results)}" + (f", из них с ошибкой: {failed}" if failed else "")
+        checked = f"Adapters checked: {len(results)}" + (f", {failed} of them failed" if failed else "")
         if foreign:
-            return last_resort(f"Среди адаптеров других пользователей тоже ничего не подошло. {checked}.")
+            return last_resort(f"None of other users' adapters fit either. {checked}.")
         if dispatch.foreign(user["id"], root):  # there is somebody else's adapter to try, but only with consent
             return finish(ASK_FOREIGN.format(checked=checked), BUTTONS)
-        return last_resort(f"Не нашёл подходящий адаптер. {checked}.")
+        return last_resort(f"No suitable adapter found. {checked}.")
     try:
-        with status(lambda s: tg.edit(chat, progress, s), f"Обрабатываю ({best.adapter.name})"):
+        with status(lambda s: tg.edit(chat, progress, s), f"Processing ({best.adapter.name})"):
             text = dispatch.run(best.adapter, message, keys)
     except dispatch.AdapterError as e:
         print(f"run {best.adapter.name}: {e.reason}: {e.detail}", file=sys.stderr, flush=True)
-        return finish(f"Адаптер {best.adapter.name} не смог обработать сообщение: {e.reason}.")
+        return finish(f"Adapter {best.adapter.name} could not process the message: {e.reason}.")
     finish(text)
 
 
@@ -145,7 +145,7 @@ def on_callback(cb, tg, keys=None, root=dispatch.ROOT, allowed=None, create_adap
     chat, question = msg["chat"]["id"], msg["message_id"]
     original = msg.get("reply_to_message")
     if not original:  # deleted, or too old for Telegram to hand it back
-        return tg.edit(chat, question, "Не вижу исходного сообщения. Пришлите его ещё раз.")
+        return tg.edit(chat, question, "I cannot see the original message. Please send it again.")
     if original.get("from", {}).get("id") != user["id"]:
         return
     with _claim_lock:
@@ -155,7 +155,7 @@ def on_callback(cb, tg, keys=None, root=dispatch.ROOT, allowed=None, create_adap
     if cb.get("data") == "f":
         handle(original, question, tg, keys, root, foreign=True, create_adapter=create_adapter)
     elif create_adapter is None:
-        tg.edit(chat, question, f"Хорошо. {NO_AGENT}")
+        tg.edit(chat, question, f"OK. {NO_AGENT}")
     else:
         handle(original, question, tg, keys, root, create=True, create_adapter=create_adapter)
 
@@ -177,7 +177,7 @@ def main():
         except Exception:
             traceback.print_exc()
             try:
-                tg.send(message["chat"]["id"], "Что-то пошло не так.", message["message_id"])
+                tg.send(message["chat"]["id"], "Something went wrong.", message["message_id"])
                 tg.delete(message["chat"]["id"], progress)
             except Exception:
                 pass
@@ -293,13 +293,13 @@ def check():
 
     # the status ticker
     seen = []
-    with status(seen.append, "Работаю", every=0.05):
+    with status(seen.append, "Working", every=0.05):
         time.sleep(0.35)
     n = len(seen)
-    assert seen[0] == "Работаю…" and n >= 4 and seen[-1] == "Работаю… 0:00", seen
+    assert seen[0] == "Working…" and n >= 4 and seen[-1] == "Working… 0:00", seen
     time.sleep(0.2)
     assert len(seen) == n, "the ticker kept running after the block"
-    with status(lambda s: 1 / 0, "Падает", every=0.05):          # a failing update must not break the block
+    with status(lambda s: 1 / 0, "Failing", every=0.05):          # a failing update must not break the block
         time.sleep(0.12)
 
     root = tempfile.mkdtemp()
@@ -326,13 +326,13 @@ def check():
     try:
         # the instant part alone: the status is out before any adapter work is done
         tg = FakeTelegram()
-        assert start(message("hello"), tg) == 1 and tg.ops == [("send", 142, "Ищу подходящий адаптер…", 5, 1)], tg.ops
+        assert start(message("hello"), tg) == 1 and tg.ops == [("send", 142, "Looking for a suitable adapter…", 5, 1)], tg.ops
 
         # no adapters at all: the status comes first, then an honest answer; nothing is run
         tg = FakeTelegram()
         process(message("hello"), tg)
-        assert tg.ops[0] == ("send", 142, "Ищу подходящий адаптер…", 5, 1), tg.ops
-        assert tg.replies() == ["Не нашёл подходящий адаптер. Проверено адаптеров: 0. " + NO_AGENT], tg.ops
+        assert tg.ops[0] == ("send", 142, "Looking for a suitable adapter…", 5, 1), tg.ops
+        assert tg.replies() == ["No suitable adapter found. Adapters checked: 0. " + NO_AGENT], tg.ops
         assert tg.ops[-1] == ("delete", 142, 1), tg.ops              # the status message is removed at the end
 
         adapter("shared/hello", "print(0.9 if m.get('text') == 'hello' else 0.0)", "print('world')")
@@ -343,7 +343,7 @@ def check():
         tg = FakeTelegram()
         process(message("hello"), tg)
         assert tg.replies() == ["world"], tg.ops
-        assert ("edit", 142, 1, "Обрабатываю (shared/hello)…") in tg.ops, tg.ops   # the user sees which adapter works
+        assert ("edit", 142, 1, "Processing (shared/hello)…") in tg.ops, tg.ops   # the user sees which adapter works
 
         tg = FakeTelegram(fail_edit=True)                             # cosmetic failures do not cost the result
         process(message("hello"), tg)
@@ -351,7 +351,7 @@ def check():
 
         tg = FakeTelegram()
         process(message("something else"), tg)
-        assert len(tg.replies()) == 1 and "Проверено адаптеров: 3, из них с ошибкой: 1" in tg.replies()[0], tg.ops
+        assert len(tg.replies()) == 1 and "Adapters checked: 3, 1 of them failed" in tg.replies()[0], tg.ops
 
         tg = FakeTelegram()
         process(message("break"), tg)
@@ -361,7 +361,7 @@ def check():
         # another user sees only the shared adapter; strangers, bots and non-users are ignored without any reply
         tg = FakeTelegram()
         process(message("break", user=7), tg)
-        assert "Проверено адаптеров: 1." in tg.replies()[0], tg.ops
+        assert "Adapters checked: 1." in tg.replies()[0], tg.ops
         tg = FakeTelegram()
         process(message("hello", user=8), tg, allowed={42})
         process({**message("hello"), "from": {"id": 9, "is_bot": True}}, tg)
@@ -375,7 +375,7 @@ def check():
         tg = FakeTelegram()
         process(message("stranger-only"), tg)
         (ask,) = [o for o in tg.ops if o[0] == "send" and len(o) == 6]
-        assert "Могу поискать среди адаптеров других пользователей" in ask[2] and "не проверены" in ask[2], ask
+        assert "I can look among other users' adapters" in ask[2] and "not verified" in ask[2], ask
         assert ask[3] == 5 and [d for _, d in ask[5]] == ["f", "n"], ask      # a reply to the user's message
         assert tg.ops[-1] == ("delete", 142, 1), tg.ops                       # the status is gone, the question stays
         assert not [o for o in tg.ops if o[0] == "edit" and "stranger" in o[3]], "the stranger ran without consent"
@@ -390,7 +390,7 @@ def check():
         on_callback(pressed("f", original=original), tg, root=root)
         assert sent(tg) == ["from stranger"], tg.ops
         assert tg.ops[0] == ("answer", "c1") and tg.ops[-1] == ("delete", 142, 9), tg.ops   # the question became the status
-        assert ("edit", 142, 9, "Обрабатываю (users/7/stranger)…") in tg.ops, tg.ops
+        assert ("edit", 142, 9, "Processing (users/7/stranger)…") in tg.ops, tg.ops
         n = len(tg.ops)
         on_callback(pressed("f", original=original), tg, root=root)           # the same button pressed twice
         assert [o for o in tg.ops[n:] if o[0] != "answer"] == [], tg.ops[n:]
@@ -405,11 +405,11 @@ def check():
 
         tg = FakeTelegram()
         on_callback(pressed("n", original=original, question=10), tg, root=root)
-        assert tg.ops == [("answer", "c1"), ("edit", 142, 10, "Хорошо. " + NO_AGENT)], tg.ops   # nothing runs
+        assert tg.ops == [("answer", "c1"), ("edit", 142, 10, "OK. " + NO_AGENT)], tg.ops   # nothing runs
 
         tg = FakeTelegram()
         on_callback(pressed("f", question=11), tg, root=root)                 # the original message is gone
-        assert len(tg.ops) == 2 and "Не вижу исходного сообщения" in tg.ops[1][3], tg.ops
+        assert len(tg.ops) == 2 and "cannot see the original message" in tg.ops[1][3], tg.ops
 
         tg = FakeTelegram()
         on_callback(pressed("f", original=message("stranger-only"), question=12, user=99), tg, root=root)
@@ -419,7 +419,7 @@ def check():
 
         tg = FakeTelegram()
         on_callback(pressed("f", original=message("nobody"), question=15), tg, root=root)
-        assert sent(tg) == ["Среди адаптеров других пользователей тоже ничего не подошло. Проверено адаптеров: 1. "
+        assert sent(tg) == ["None of other users' adapters fit either. Adapters checked: 1. "
                             + NO_AGENT], tg.ops
 
         # the last resort: the agent builds an adapter, or fails honestly
@@ -438,12 +438,12 @@ def check():
         tg = FakeTelegram()
         handle(lonely, start(lonely, tg), tg, root=empty, create_adapter=good_agent)
         assert asked_agent == [(42, lonely)], asked_agent
-        assert sent(tg)[1] == "the transcript" and "создан адаптер users/42/new_one" in sent(tg)[2], tg.ops
-        assert ("edit", 142, 1, "Создаю адаптер для такого сообщения…") in tg.ops and ("delete", 142, 1) in tg.ops, tg.ops
+        assert sent(tg)[1] == "the transcript" and "Created adapter users/42/new_one" in sent(tg)[2], tg.ops
+        assert ("edit", 142, 1, "Creating an adapter for this kind of message…") in tg.ops and ("delete", 142, 1) in tg.ops, tg.ops
 
         tg = FakeTelegram()
         handle(lonely, start(lonely, tg), tg, root=empty, create_adapter=bad_agent)
-        assert sent(tg)[1:] == ["Не получилось создать адаптер: the adapter did not pass the acceptance."], tg.ops
+        assert sent(tg)[1:] == ["Could not create an adapter: the adapter did not pass the acceptance."], tg.ops
         assert "details" not in "".join(sent(tg)), "details of the failure leaked to the user"
 
         asked_agent.clear()                                                    # others' adapters exist: ask first

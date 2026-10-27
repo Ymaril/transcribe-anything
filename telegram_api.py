@@ -45,7 +45,7 @@ class Telegram:
             return api(self.token, "sendMessage", {"chat_id": chat_id, "text": text, "reply_parameters": reply})["message_id"]
         return upload(self.token, "sendDocument",
                       {"chat_id": chat_id, "reply_parameters": json.dumps(reply),
-                       "caption": "Текст не поместился в сообщение, прикладываю файлом."},
+                       "caption": "The text does not fit into a message, attaching it as a file."},
                       "transcript.txt", text.encode())["message_id"]
 
     def edit(self, chat_id, message_id, text):
@@ -111,20 +111,20 @@ def check():
         assert path == "/bottok/sendMessage" and body["text"] == "short", requests[-1]
         assert body["reply_parameters"]["message_id"] == 55
 
-        long_text = "".join(f"строка {i}\n" for i in range(3000))          # does not fit: one file, nothing lost
+        long_text = "".join(f"line {i} naïve café ✓ 日本語\n" for i in range(3000))          # does not fit: one file, nothing lost
         assert len(long_text) > LIMIT and tg.send(7, long_text, 56) == 102
         path, fields, filename = requests[-1]
         assert path == "/bottok/sendDocument" and filename == ["transcript.txt"], requests[-1]
         assert fields["document"].decode() == long_text, "the file differs from the text"
         assert fields["chat_id"] == b"7" and json.loads(fields["reply_parameters"])["message_id"] == 56
-        assert "файлом" in fields["caption"].decode()
+        assert "as a file" in fields["caption"].decode()
         assert tg.send(7, "x" * LIMIT, 57) == 103 and requests[-1][0] == "/bottok/sendMessage"   # exactly at the limit
         assert tg.send(7, "x" * (LIMIT + 1), 57) == 104 and requests[-1][0] == "/bottok/sendDocument"
 
-        assert tg.ask(7, "Продолжить?", 58, [("Да", "f"), ("Нет", "n")]) == 100 + len(requests)   # buttons
+        assert tg.ask(7, "Continue?", 58, [("Yes", "f"), ("No", "n")]) == 100 + len(requests)   # buttons
         path, body, _ = requests[-1]
         assert path == "/bottok/sendMessage" and body["reply_markup"] == {"inline_keyboard": [[
-            {"text": "Да", "callback_data": "f"}, {"text": "Нет", "callback_data": "n"}]]}, body
+            {"text": "Yes", "callback_data": "f"}, {"text": "No", "callback_data": "n"}]]}, body
         assert body["reply_parameters"]["message_id"] == 58
         tg.answer("cb1")
         assert requests[-1][:2] == ("/bottok/answerCallbackQuery", {"callback_query_id": "cb1"}), requests[-1]

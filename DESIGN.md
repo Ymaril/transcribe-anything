@@ -1,210 +1,216 @@
-# Transcribe bot: дизайн
+# Transcribe bot: design
 
-Telegram-бот, которому можно прислать что угодно (голосовое, видео, ссылку, файл, текст).
-Бот возвращает транскрипт. Под каждый новый тип входа агент сам пишет адаптер.
-Ничего не хранится, кроме самих адаптеров.
+A Telegram bot you can send anything to (a voice message, a video, a link, a file, text) and get a transcript back.
+For every new kind of input an agent writes an adapter by itself. Nothing is stored except the adapters.
 
-## Структура кода
+## Code structure
 
-Слои, зависимости идут только сверху вниз:
+Layers, dependencies only go downwards:
 
-- `bot.py` — сценарий диалога и запуск (конфигурация из `.env`, опрос Telegram, статус, кнопки);
-- `telegram_api.py` — клиент Bot API (JSON-вызовы, отправка файла), про адаптеры ничего не знает;
-- `agent.py` + `agent/` — агент-достройщик (последнее средство): запуск Claude Code, проверка файлов, приёмка;
-  бот знает о нём только через функцию `create_adapter(user_id, message)`, без агента всё остальное работает;
-- `dispatch.py` — адаптеры: поиск, сборка образа (политика), `match`, выбор, `run`, глобальные слоты;
-- `sandbox.py` — запуск контейнеров как утилит (stdin/stdout) и всё, что знает про docker для образов;
-- `sidecar/` — сеть и ключи: правила `iptables`, прокси (`proxy.py`), `up`/`down`, контракт окружения (`env()`);
-- `adapters/` — `base/` (базовый образ), `shared/` (общие), `users/<id>/` (личные).
+- `bot.py`: the conversation flow and startup (configuration from `.env`, Telegram polling, status, buttons);
+- `telegram_api.py`: a Bot API client (JSON calls, sending a file); knows nothing about adapters;
+- `agent.py` + `agent/`: the agent (the last resort): runs Claude Code, checks the files, acceptance;
+  the bot knows it only as the function `create_adapter(user_id, message)`; without the agent everything else works;
+- `dispatch.py`: adapters: discovery, image build (policy), `match`, choice, `run`, global slots;
+- `sandbox.py`: runs containers as utilities (stdin/stdout) and everything that knows docker for images;
+- `sidecar/`: network and keys: `iptables` rules, the proxy (`proxy.py`), `up`/`down`, the environment contract (`env()`);
+- `adapters/`: `base/` (the base image), `shared/` (common ones), `users/<id>/` (personal ones).
 
-Каждый модуль проверяет себя (`python3 модуль.py`, у бота `python3 bot.py --check`); `./check_all.sh` запускает все
-проверки подряд и дополнительно убеждается, что не осталось контейнеров.
+Every module checks itself (`python3 module.py`, for the bot `python3 bot.py --check`); `./check_all.sh` runs all the
+checks one after another and also makes sure that no containers are left behind.
 
-## Вход
+## Input
 
-Единственный вход всей системы: объект Telegram `Message` (JSON). Понятия «файл» на
-уровне бота нет. Вложения скачивает сам адаптер по `file_id`.
+The only input of the whole system is a Telegram `Message` object (JSON). There is no notion of a "file" at the
+level of the bot. The adapter itself downloads attachments by `file_id`.
 
-## Адаптер
+## Adapter
 
-Папка с исходниками:
+A directory with sources:
 
-- `Dockerfile` — зависимости ставятся при сборке образа (образ собирается лениво при первом запуске,
-  тег назначает хост по хэшу содержимого папки, поэтому изменённый или заменённый адаптер пересобирается).
-- В образе должны быть исполняемые `/adapter/match` и `/adapter/run` (обычно `COPY . /adapter`).
-- Это утилиты: сообщение (JSON) приходит на stdin, ничего не монтируется, временные файлы в `/tmp` (tmpfs).
-- `match` печатает число 0..1 в stdout (уверенность; берётся последняя непустая строка). Таймаут 10 с,
-  вывод до 64 КБ, любая ошибка (падение, таймаут, не число) означает оценку 0.
-- `run` печатает транскрипт в stdout: не пустой, до 2 МБ. stderr идёт в лог (хранится последние 4 КБ).
-  Вывод читается с ограничением по размеру, чтобы бесконечно печатающий адаптер не съел память хоста.
-  Ошибка запуска (падение, таймаут, нарушение контракта) это `AdapterError`: короткая причина для
-  пользователя и подробности для лога.
+- `Dockerfile`: dependencies are installed when the image is built (the image is built lazily on first use; the host
+  names the tag after the hash of the directory content, so a changed or replaced adapter is rebuilt).
+- The image must contain executable `/adapter/match` and `/adapter/run` (usually `COPY . /adapter`).
+- They are utilities: the message (JSON) arrives on stdin, nothing is mounted, temporary files go to `/tmp` (tmpfs).
+- `match` prints a number 0..1 to stdout (confidence; the last non-empty line is taken). Timeout 10 s, output up to
+  64 KB, any error (a crash, a timeout, not a number) means a score of 0.
+- `run` prints the transcript to stdout: non-empty, up to 2 MB. stderr goes to the log (the last 4 KB are kept).
+  The output is read with a size limit so that an adapter that prints endlessly cannot eat the host's memory.
+  A failed run (a crash, a timeout, a broken contract) is an `AdapterError`: a short reason for the user and
+  details for the log.
 
-Один образ, две точки входа. `match` и `run` могут ходить в сеть (скачать вложение, проверить ссылку).
+One image, two entry points. `match` and `run` may use the network (to download an attachment, to check a link).
 
-Базовый образ `transcribe-base` (python:slim, ffmpeg, непривилегированный пользователь, `WORKDIR /tmp`)
-содержит утилиту `transcribe <файл>`: отправляет аудио через прокси в OpenAI (режет/сжимает
-файлы больше лимита 25 МБ) и печатает текст. Адаптеры строятся `FROM transcribe-base`,
-специфичные зависимости (yt-dlp и т.д.) ставят сами. Ограничения безопасности задаются флагами
-запуска (`run_sandboxed`), а не образом.
+The base image `transcribe-base` (python:slim, ffmpeg, an unprivileged user, `WORKDIR /tmp`) contains the utility
+`transcribe <file>`: it sends audio to OpenAI through the proxy (it splits and compresses files over the 25 MB limit)
+and prints the text. Adapters are built `FROM transcribe-base` and install their specific dependencies (yt-dlp etc.)
+themselves. The security restrictions are set by the run flags (`run_sandboxed`), not by the image.
 
-Расположение:
+Location:
 
-- `adapters/shared/<имя>/` — общие, верифицированы по определению. Владелец перекладывает руками.
-- `adapters/users/<user_id>/<имя>/` — личные. Создаёт агент.
+- `adapters/shared/<name>/`: common ones, verified by definition. The owner moves them in by hand.
+- `adapters/users/<user_id>/<name>/`: personal ones. Created by the agent.
 
-`match` — только подсказка. Технически можно запустить любой адаптер; кнопка в боте запускает выбранный без `match`.
+`match` is only a hint. Technically any adapter can be run; a button in the bot runs the chosen one without `match`.
 
-## Поток
+## Flow
 
-1. Пришло сообщение.
-2. `match` по своим и shared адаптерам (все сразу, таймаут ~10 с). Сколько контейнеров реально работает одновременно,
-   решают глобальные слоты на все сообщения вместе: 3 для `match` и 4 для `run` (отдельные, чтобы долгая
-   транскрибация не мешала подбирать адаптер новым сообщениям). При равных оценках свой адаптер выигрывает у shared.
-3. Победитель выше порога: запуск `run`, ответ пользователю.
-4. Никто не подошёл: бот отвечает на сообщение вопросом с кнопками:
-   «Не нашёл подходящий способ среди ваших и проверенных. Могу поискать среди адаптеров
-   других пользователей. Они не проверены, и даже сама проверка может передать им ваше
-   сообщение и вложения. Проверить?»
-   - Да: `match` по чужим личным адаптерам, победитель сразу выполняется. Никто не подошёл: п. 5.
-   - Нет: п. 5.
-   Если чужих адаптеров вообще нет, вопрос не задаётся (спрашивать нечего), бот сразу переходит к п. 5.
-5. Последнее средство: агент создаёт новый адаптер в `adapters/users/<user_id>/`, затем запуск.
-   Агент это ответвление: вся остальная система (адаптеры, выбор, запуск, согласие) работает без него и ничего о
-   нём не знает. Пока агента нет, бот честно отвечает «Создавать новые адаптеры я пока не умею».
-6. Адаптер упал: пользователю короткая ошибка. Адаптер остаётся как есть, ничего не чиним.
+1. A message arrives.
+2. `match` over the user's own and the shared adapters (all at once, timeout ~10 s). How many containers really run
+   at the same time is decided by global slots shared by all messages: 3 for `match` and 4 for `run` (separate, so
+   that a long transcription does not keep new messages from finding an adapter). On equal scores the user's own
+   adapter beats a shared one.
+3. A winner above the threshold: `run` it and reply to the user.
+4. Nothing fits: the bot replies to the message with a question and buttons: "No suitable adapter among yours and
+   the verified ones. I can look among other users' adapters. They are not verified, and even matching may hand them
+   your message and attachments. Check?"
+   - Yes: `match` over other users' personal adapters, the winner is run at once. Nothing fits: step 5.
+   - No: step 5.
+   If there are no other users' adapters at all, the question is not asked (there is nothing to ask about) and the
+   bot goes straight to step 5.
+5. The last resort: the agent creates a new adapter in `adapters/users/<user_id>/`, then it runs. The agent is a
+   branch: the rest of the system (adapters, choice, running, consent) works without it and knows nothing about it.
+   Without the agent the bot honestly answers "I cannot create new adapters yet."
+6. The adapter failed: the user gets a short error. The adapter stays as it is, nothing is repaired.
 
-Кнопки работают без состояния: вопрос отправляется ответом на исходное сообщение, из
-`callback_query.message.reply_to_message` берётся оригинал. В `callback_data` короткий
-идентификатор (лимит 64 байта). Если оригинал недоступен (удалён/слишком старый), бот
-просит прислать заново.
+The buttons work without state: the question is sent as a reply to the original message, and the original is taken
+from `callback_query.message.reply_to_message`. `callback_data` is a short identifier (the limit is 64 bytes). If
+the original is unavailable (deleted or too old), the bot asks to send it again.
 
-## Бот
+## Bot
 
-- Только личные чаты (группы и каналы игнорируются). Список разрешённых пользователей необязателен
-  (`ALLOWED_USER_IDS` в `.env`); id каждого писавшего пользователя печатается в консоль.
-- Мгновенный ответ «Ищу подходящий адаптер…» отправляет поток опроса, до постановки сообщения в обработку
-  (иначе при занятых обработчиках пользователь не получал бы вообще ничего). Обработчиков много (потоки
-  дешёвые), нагрузку ограничивают слоты контейнеров.
-- Статус правкой одного сообщения: этап, имя адаптера, прошедшее время (каждые 5 с). Реального прогресса из
-  адаптера нет, это честное «работаю, прошло столько-то». Сбой правки статуса на результат не влияет.
-- Итог приходит новым сообщением (правка не уведомляет), статус удаляется.
-- Вопрос про чужие адаптеры это новое сообщение-ответ на сообщение пользователя с кнопками «Да, проверить» /
-  «Нет». Нажатие приходит как `callback_query`, внутри которого Telegram возвращает исходное сообщение
-  (`reply_to_message`), так что бот ничего не хранит. Сообщение с вопросом становится статусом и после
-  ответа удаляется. Защита: нажать может только автор исходного сообщения, повторное нажатие игнорируется
-  (в памяти процесса помнятся уже обработанные вопросы), исчезнувший оригинал даёт «Пришлите ещё раз».
-- Текст длиннее 4000 символов не режется на сообщения (длинная серия упирается в лимиты частоты Telegram и
-  засоряет чат): он отправляется одним файлом `transcript.txt` с подписью.
+- Private chats only (groups and channels are ignored). A list of allowed users is optional (`ALLOWED_USER_IDS` in
+  `.env`); the id of everyone who writes is printed to the console.
+- The instant reply "Looking for a suitable adapter…" is sent by the polling thread, before the message is queued
+  for processing (otherwise, with all workers busy, the user would get nothing at all). There are many workers
+  (threads are cheap); the load is limited by the container slots.
+- The status is one message that is edited: the stage, the adapter name, the elapsed time (every 5 s). There is no
+  real progress from an adapter; this is an honest "working, this much time has passed". A failure to edit the
+  status does not affect the result.
+- The result arrives as a new message (an edit does not notify), the status is deleted.
+- The question about other users' adapters is a new message, a reply to the user's message, with the buttons
+  "Yes, check" / "No". A press arrives as a `callback_query`, inside which Telegram returns the original message
+  (`reply_to_message`), so the bot stores nothing. The question message becomes the status and is deleted after the
+  answer. Protection: only the author of the original message can press, a repeated press is ignored (already
+  answered questions are remembered in the process memory), a vanished original gives "please send it again".
+- A text longer than 4000 characters is not cut into messages (a long series runs into Telegram's rate limits and
+  clutters the chat): it is sent as one file, `transcript.txt`, with a caption.
 
-## Песочница
+## Sandbox
 
-Всё чужое выполняется в одноразовых docker-контейнерах: read-only, `--cap-drop ALL`,
-`no-new-privileges`, лимиты памяти/CPU/процессов, таймаут, непривилегированный пользователь.
-Позже: gVisor (`--runtime=runsc`).
+Everything foreign runs in disposable docker containers: read-only, `--cap-drop ALL`, `no-new-privileges`, limits on
+memory/CPU/processes, a timeout, an unprivileged user. Later: gVisor (`--runtime=runsc`).
 
-Сеть. На каждый запуск контейнера поднимается sidecar (`sidecar/`): контейнер с `NET_ADMIN`, который
-владеет сетевым пространством имён. Контейнер адаптера присоединяется к нему
-(`--network container:<sidecar>`) без привилегий и не может менять правила. Настройки хоста не нужны.
-Правила (iptables внутри sidecar'а, `sidecar/rules.sh`):
+Network. For every container run a sidecar is started (`sidecar/`): a container with `NET_ADMIN` that owns the network
+namespace. The adapter container joins it (`--network container:<sidecar>`) without privileges and cannot change the
+rules. No host configuration is needed. The rules (iptables inside the sidecar, `sidecar/rules.sh`):
 
-- интернет и DNS открыты (любые протоколы, включая UDP), приватные диапазоны закрыты: хост, LAN,
-  соседние контейнеры (защита от SSRF);
-- лимит исходящих байт на запуск (по умолчанию 5 МБ): скачивать можно много, вынести можно только крохи.
-  Скачивание стоит ~0,5% своего размера в ACK-пакетах;
-- IPv6 отключён.
+- the internet and DNS are open (any protocol, UDP included), private ranges are closed: the host, the LAN,
+  neighbouring containers (SSRF protection);
+- a limit on outgoing bytes per run (5 MB by default): a lot can be downloaded, only crumbs can be carried out.
+  A download costs ~0.5% of its size in ACK packets;
+- IPv6 is disabled.
 
-Ключей внутри контейнера адаптера нет. Прокси (`sidecar/proxy.py`) работает внутри sidecar'а на
-`127.0.0.1:8080` и подставляет ключи OpenAI и Telegram (скачивание вложений); для агента будет добавлен
-маршрут Anthropic. Трафик прокси (uid 10001) исключён из квоты и фильтра: он идёт только к доверенным API.
-Контейнер адаптера получает `OPENAI_BASE_URL`, `OPENAI_API_KEY=unused`, `TB_PROXY`.
+There are no keys inside the adapter container. The proxy (`sidecar/proxy.py`) runs inside the sidecar on
+`127.0.0.1:8080` and adds the OpenAI and Telegram keys (downloading attachments); only the agent's sidecar also gets
+the Anthropic route and key. The proxy's traffic (uid 10001) is excluded from the quota and the filter: it goes only
+to trusted APIs. The adapter container receives `OPENAI_BASE_URL`, `OPENAI_API_KEY=unused`, `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_API_KEY=unused`, `TB_PROXY`.
 
-Остаточный риск принят: утечка не нулевая, а ограничена лимитом исходящих байт.
+The residual risk is accepted: a leak is not zero but it is bounded by the outgoing byte limit.
 
-Прокси не должен быть чёрным ходом к ключам:
+The proxy must not be a back door to the keys:
 
-- Telegram: только `getFile` и скачивание файла. Остальные методы Bot API (sendMessage и т.д.) закрыты.
-  Telegram нумерует файлы последовательно (`voice/file_41`, `42`, ... проверено на стикерах: следующий номер
-  угадывается точно, и скачать путь можно сразу после чьего-то `getFile`), поэтому реальный путь через прокси
-  опасен: вредоносный адаптер перебирал бы соседние номера и забирал файлы других пользователей. Форма API
-  сохранена (`file_id` -> `getFile` -> `file_path` -> скачивание), но `file_path` в ответе `getFile` заменяется
-  непрозрачным токеном: он зашифрован и подписан ключом, который существует только в памяти этого прокси (то
-  есть одного запуска). Скачать можно лишь токен, сделанный этим прокси. Ничего не хранится.
-- OpenAI: только эндпоинт транскрибации с фиксированной моделью.
-- Аутентификации нет: прокси слушает loopback sidecar'а, до которого достаёт только контейнер этого запуска.
-  Зациклившийся контейнер останавливается таймаутом.
+- Telegram: only `getFile` and downloading a file. The other Bot API methods (sendMessage etc.) are closed.
+  Telegram numbers files sequentially (`voice/file_41`, `42`, ...; checked on stickers: the next number can be
+  guessed exactly, and a path can be downloaded right after someone's `getFile`), so a real path through the proxy
+  is dangerous: a malicious adapter would try the neighbouring numbers and take other users' files. The shape of
+  the API is kept (`file_id` -> `getFile` -> `file_path` -> download), but `file_path` in the `getFile` answer is
+  replaced with an opaque token: it is encrypted and signed with a key that exists only in the memory of this proxy
+  (that is, of one run). Only a token made by this proxy can be downloaded. Nothing is stored.
+- OpenAI: only the transcription endpoint with fixed models.
+- Anthropic: only `/v1/messages` and `/v1/messages/count_tokens` (with the query string, Claude Code calls
+  `?beta=true`), only sonnet and haiku models, the answer is streamed through as it arrives. The key is given only
+  to the agent's sidecar; the bot never passes it to the sidecars of adapters.
+- There is no authentication: the proxy listens on the sidecar's loopback, which only the container of this run
+  can reach. A looping container is stopped by its timeout.
 
-## Сборка образов
+## Image builds
 
-Образ адаптера произвольный: агент пишет свой `Dockerfile`, содержимое образа не ограничиваем
-(при запуске всё равно действуют флаги `run_sandboxed`). Ограничивается сама сборка, потому что
-`RUN` — произвольный код с сетью на хосте. В контексте сборки нет секретов и данных пользователей
-(только папка адаптера). Ступень 1:
+An adapter image is arbitrary: the agent writes its own `Dockerfile`, the image content is not restricted (the
+`run_sandboxed` flags apply at run time anyway). The build itself is restricted, because `RUN` is arbitrary code with
+network access on the host. The build context holds no secrets and no user data (only the adapter directory). Stage 1:
 
-- таймаут на сборку (лимиты `--memory`, `--cpu-quota` у BuildKit молча игнорируются, проверено:
-  сборка выделила 400 МБ при `--memory 100m`; ограничение ресурсов сборки открыто, см. ниже);
-- сеть сборки sidecar'ом пока НЕ покрыта (`docker build` ходит по обычному мосту, `RUN` может достать до хоста
-  и LAN): открытый вопрос, см. ниже;
-- Dockerfile с директивой `# syntax=` отвергается;
-- имя образа назначает хост, образы не пушим, credentials не монтируем;
-- квота на число образов на пользователя, периодическая очистка.
+- a timeout on the build (the `--memory` and `--cpu-quota` limits are silently ignored by BuildKit, checked: the
+  build allocated 400 MB with `--memory 100m`; limiting build resources is open, see below);
+- the build network is NOT covered by the sidecar yet (`docker build` uses the ordinary bridge, `RUN` can reach the
+  host and the LAN): an open question, see below;
+- a Dockerfile with a `# syntax=` directive is rejected;
+- the host names the image, images are not pushed, no credentials are mounted;
+- a quota on the number of images per user, periodic cleanup.
 
-Позже: rootless docker целиком (заодно убирает «группа docker = root»), для открытого бота
-сборка в microVM (нужен KVM). Docker-сокет никогда не попадает в контейнеры.
+Later: rootless docker as a whole (it also removes "docker group = root"), for an open bot builds in a microVM
+(KVM is needed). The docker socket never gets into containers.
 
-## Агент-достройщик
+## The agent
 
-- Вызывается только когда адаптера нет. Всегда создаёт новый адаптер, ничего не правит. Включён, только если в
-  `.env` есть `ANTHROPIC_API_KEY` и задан `ALLOWED_USER_IDS` (агент стоит денег: для закрытого круга).
-- Это Claude Code (`claude -p`) в контейнере `tb-agent` (образ `agent/Dockerfile` на базе `transcribe-base`) с
-  песочницей и сетью как у адаптеров. Ключ Anthropic через прокси sidecar'а, внутри контейнера его нет; получает
-  только sidecar агента, sidecar'ы адаптеров ключа не имеют. Модели только sonnet и haiku. Инструкция:
-  `agent/PROMPT.md` (контракт адаптера, окружение, как скачивать файлы Telegram, образец `telegram_voice`, само сообщение).
-- **Единственное исключение из «контейнеры без монтирований»:** агенту дан записываемый том. Хост монтирует в
-  `/adapter` каталог `adapters/users/<id>/.staging/<случайное>` (папки с точкой поиск адаптеров не видит, поэтому
-  недописанный адаптер никто не соберёт). Агент запускается с uid хоста: всё, что он создал, принадлежит нам и
-  читается, переносится и удаляется без помощника с root. Том сохраняется между попытками, поэтому повтор идёт по
-  тем же файлам.
-- Агент не сдаёт результат на слово. Хост проверяет дерево (нет симлинков и нестандартных файлов, до 100 файлов,
-  до 1 МБ на файл и 5 МБ всего, есть `Dockerfile`, `match`, `run`; нечитаемый каталог это ошибка), собирает образ,
-  запускает `match` на этом сообщении (не ниже порога) и `run` (непустой транскрипт). Транскрипт приёмки и есть
-  ответ пользователю, повторно не запускается.
-- Две попытки: если приёмка не прошла, агент получает текст ошибки и те же файлы. Потолок на попытку $2 (`--max-budget-usd`)
-  и 20 минут. Образы неудачных попыток удаляются. Не вышло: пользователю короткая причина, в `adapters/` ничего не
-  попадает (подробности в консоль).
-- Имя адаптера агент называет последней строкой своего ответа; не подошло под `[a-z][a-z0-9_]{0,29}` или занято:
-  случайное имя или суффикс. Адаптер переносится `rename` из staging на место (содержимое и тег образа не меняются).
-- Одновременно работает один агент.
+- Called only when there is no adapter. It always creates a new adapter and never edits one. Enabled only if
+  `.env` has `ANTHROPIC_API_KEY` and `ALLOWED_USER_IDS` is set (the agent costs money: for a closed circle).
+- It is Claude Code (`claude -p`) in the `tb-agent` container (the `agent/Dockerfile` image on top of
+  `transcribe-base`) with the same sandbox and network as adapters. The Anthropic key goes through the sidecar's
+  proxy and is not inside the container; only the agent's sidecar has it, the sidecars of adapters do not. Only
+  sonnet and haiku models. The instructions are `agent/PROMPT.md` (the adapter contract, the environment, how to
+  download Telegram files, the `telegram_voice` reference, the message itself).
+- **The only exception to "containers without mounts":** the agent gets a writable volume. The host mounts the
+  directory `adapters/users/<id>/.staging/<random>` at `/adapter` (adapter discovery does not see dot-directories, so
+  nobody builds an unfinished adapter). The agent runs with the host's uid: everything it creates belongs to us and
+  can be read, moved and deleted without a root helper. The volume survives between attempts, so a retry works on
+  the same files.
+- The agent's word is not accepted. The host checks the tree (no symlinks or special files, up to 100 files, up to
+  1 MB per file and 5 MB in total, `Dockerfile`, `match` and `run` exist; an unreadable directory is an error),
+  builds the image, runs `match` on this message (at or above the threshold) and `run` (a non-empty transcript).
+  The transcript of the acceptance run is the user's answer and is not run again.
+- Two attempts: if the acceptance fails, the agent gets the error text and the same files. A ceiling of $2 per
+  attempt (`--max-budget-usd`) and 20 minutes. Images of failed attempts are deleted. If it fails: the user gets a
+  short reason, nothing lands in `adapters/` (the details go to the console).
+- The agent names the adapter in the last line of its answer; if that does not fit `[a-z][a-z0-9_]{0,29}` (quotes,
+  backticks, asterisks and a trailing full stop are tolerated) or is taken: a random name or a suffix. The adapter
+  is moved from staging into place with `rename` (the content and so the image tag do not change).
+- Honesty is part of the instructions: never fail silently, say in the output when the result is partial, do not
+  invent arbitrary caps ("the first 10 items"), the time limit is the only cap.
+- One agent works at a time.
 
-## Данные
+## Data
 
-Не хранятся. Единственное постоянное состояние: `adapters/`. Лимиты по пользователям (позже) хранятся в памяти
-бота и при перезапуске могут обнуляться.
+Nothing is stored. The only persistent state is `adapters/`. Per-user limits (later) are kept in the bot's memory and
+may reset on restart.
 
-## Не делаем
+## Not doing
 
-Починку и удаление адаптеров, верификацию в боте, админ-роль, историю, поиск по транскриптам,
-форматирование результата, тесты `match` на синтетических данных, оплату, веб-интерфейс.
+Repairing and deleting adapters, verification in the bot, an admin role, history, search over transcripts, formatting
+of the result, tests of `match` on synthetic data, payments, a web interface.
 
-## Дальше (решено, но не сделано)
+## Next (decided, not done)
 
-- Не ждать завершения всех `match`: брать адаптер, как только найден подходящий.
-- Логи в файл (сейчас только консоль). Ошибки адаптеров видны лишь пока смотришь на терминал.
-- Упаковать бота в docker; вся система целиком в docker, вместе с compose.
-- Сборка образов от агента (шаг агента): решить вместе ресурсы сборки, сеть сборки и очистку устаревших образов.
-- Лимиты на пользователя (бот сейчас открыт всем, если не задан `ALLOWED_USER_IDS`).
-- Обработка перезапуска: при старте удалять контейнеры `tb-*` (осиротевшие sidecar'ы живут до суток).
+- Do not wait for all `match` runs to finish: take an adapter as soon as a suitable one is found.
+- Logs to a file (now only the console). Adapter errors are visible only while you watch the terminal.
+- Pack the bot into docker; the whole system in docker, with compose.
+- Image builds of the agent: decide the build resources, the build network and the cleanup of stale images together.
+- Per-user limits (the bot is open to everyone if `ALLOWED_USER_IDS` is not set).
+- Restart handling: delete the `tb-*` containers at startup (orphaned sidecars live up to a day).
 
-## Открытые вопросы
+## Open questions
 
-- Подобрать лимит исходящих байт по реальным запросам yt-dlp.
-- Ресурсы сборки образов (память, CPU, диск): флаги `docker build` не действуют под BuildKit; варианты:
-  classic builder (`DOCKER_BUILDKIT=0`), конфигурация демона BuildKit, сборка внутри контейнера с лимитами.
-- Сеть сборки образов: `docker build --network container:<sidecar>` BuildKit не поддерживает (только classic builder);
-  варианты: classic builder, сборка внутри песочницы (buildah/rootless BuildKit в контейнере), принять риск ступени 1.
-- Sidecar поднимается на каждый запуск контейнера (в том числе на каждый `match`): время старта растёт с
-  числом адаптеров. Образ sidecar'а собирается один раз на процесс (изменения правил требуют перезапуска бота).
-- Префильтр `match` (дешёвый, без сети), если адаптеров станет много или экспозиция чужим адаптерам начнёт беспокоить.
-- Лимиты на пользователя: размер, число запросов, создание адаптеров в сутки, глобальный бюджет агента.
-- Очистка давно не используемых docker-образов.
-- Лимит Bot API: скачивание файлов до 20 МБ (больше только через локальный Bot API server).
+- Pick the outgoing byte limit from real yt-dlp requests.
+- Image build resources (memory, CPU, disk): `docker build` flags do not work under BuildKit; options: the classic
+  builder (`DOCKER_BUILDKIT=0`), BuildKit daemon configuration, building inside a container with limits.
+- The image build network: `docker build --network container:<sidecar>` is not supported by BuildKit (only by the
+  classic builder); options: the classic builder, building inside a sandbox (buildah/rootless BuildKit in a
+  container), accepting the stage 1 risk.
+- A sidecar is started for every container run (every `match` included): the start time grows with the number of
+  adapters. The sidecar image is built once per process (changes to the rules need a bot restart).
+- A cheap prefilter for `match` (without network), if there get to be many adapters or the exposure to other users'
+  adapters starts to worry.
+- Per-user limits: size, number of requests, adapters created per day, a global budget for the agent.
+- Cleanup of docker images that have not been used for long.
+- The Bot API limit: files up to 20 MB can be downloaded (more only through a local Bot API server).

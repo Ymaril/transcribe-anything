@@ -226,7 +226,7 @@ elif __name__ == "__main__":  # self-check: python3 sidecar/proxy.py
         assert call("GET", "/telegram/file/" + bad)[0] == 403, bad
     other = Proxy("k", "t", base, base)                                  # another run has another key
     assert other.unseal(token) is None and proxy.unseal(token) == "voice/file_1.ogg"
-    for text in ("", "a", "voice/file_1.ogg", "путь/файл_1.oga", "x" * 100):
+    for text in ("", "a", "voice/file_1.ogg", "chemin/fichier_é.oga", "x" * 100):
         assert proxy.unseal(proxy.seal(text)) == text and other.unseal(proxy.seal(text)) is None, text
     assert len(seen) == n, "a rejected download reached upstream"
 

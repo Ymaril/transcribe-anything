@@ -168,7 +168,7 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
             script(f"{base}/{path}/run", run_code)
 
     for name, code in {
-        "ok": "sys.stderr.write('log line\\n'); print('  текст: ' + m['text'] + '\\n')",
+        "ok": "sys.stderr.write('log line\\n'); print('  text: ' + m['text'] + '\\n')",
         "none": "pass",
         "blank": "print('   ')",
         "crash": "sys.stderr.write('boom'); sys.exit(5)",
@@ -225,7 +225,7 @@ if __name__ == "__main__":  # self-check: python3 dispatch.py
 
         # run: stdout is the transcript, stderr is only for the log
         A = {a.name: a for a in visible(43, root2)}
-        assert run(A["users/43/ok"], {"text": "привет"}) == "текст: привет"
+        assert run(A["users/43/ok"], {"text": "naïve café ✓ 日本語"}) == "text: naïve café ✓ 日本語"
 
         def fails(name, reason, **kw):
             try:

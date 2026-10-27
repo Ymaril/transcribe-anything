@@ -139,8 +139,8 @@ if __name__ == "__main__":  # self-check: python3 sandbox.py (needs internet)
     shutil.rmtree(mine)                                                       # ours to delete, no root helper needed
 
     # stdin in, stdout/stderr out
-    r = run_sandboxed(IMG, ["sh", "-c", "cat; echo err >&2; exit 3"], stdin="привет\n")
-    assert (r.returncode, r.stdout, r.stderr) == (3, "привет\n", "err\n"), r
+    r = run_sandboxed(IMG, ["sh", "-c", "cat; echo err >&2; exit 3"], stdin="naïve café ✓ 日本語\n")
+    assert (r.returncode, r.stdout, r.stderr) == (3, "naïve café ✓ 日本語\n", "err\n"), r
     assert py("import sys; sys.stderr.write('a' * 10000 + 'END')").stderr.endswith("END"), "stderr tail lost"
     assert len(py("import sys; sys.stderr.write('a' * 10000)").stderr) == 4096
 

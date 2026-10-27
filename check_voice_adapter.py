@@ -34,7 +34,7 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         seen.append(("POST", self.path, len(body) > 5000))  # transcribe re-encodes: the audio itself is in there
-        self.reply(200, json.dumps({"text": "привет из голосового"}).encode())
+        self.reply(200, json.dumps({"text": "héllo from the voice message ✓"}).encode())
 
 srv = HTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -50,7 +50,7 @@ for other in ({"text": "hi"}, {"audio": {"file_id": "x"}}, {"photo": []}):
     assert float(adapter("match", other).stdout) == 0.0, other
 
 r = adapter("run", voice)
-assert r.returncode == 0 and r.stdout.strip() == "привет из голосового", (r.stdout, r.stderr)
+assert r.returncode == 0 and r.stdout.strip() == "héllo from the voice message ✓", (r.stdout, r.stderr)
 get_file = [s for s in seen if s[1] == "/telegram/getFile"]
 assert len(get_file) == 1 and urllib.parse.parse_qs(get_file[0][2]) == {"file_id": ["abc&x=1"]}, seen  # encoded, not injected
 assert ("GET", "/telegram/file/voice/file_1.oga", "") in seen, seen

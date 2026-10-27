@@ -58,8 +58,8 @@ this message.
    must pass both: `match` at 0.5 or above, `run` printing a non-empty transcript.
 4. Keep it simple and small. No tests, no README, no extra files.
    Be honest in the output: never fail silently. If you can handle only part of the input (a long playlist, a huge
-   file) or you skip something, say so in the output itself, in Russian (the users read Russian), for example a last
-   line `Транскрибировано 10 из 29 видео, остальные не обработаны (лимит времени).`. Do not invent arbitrary caps such
+   file) or you skip something, say so in the output itself, in English, for example a last
+   line `Transcribed 10 of 29 videos, the rest were not processed (time limit).`. Do not invent arbitrary caps such
    as "the first 10 items": the time limit is the only cap. Work through the input in order, check the clock, and stop
    at about 12 minutes (keep a margin below the 15 minute limit), then say how many items were done. If nothing can be done, exit
    non-zero with the reason on stderr, or print a short explanation of why; never print an empty or misleading result.
